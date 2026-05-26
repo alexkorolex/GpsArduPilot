@@ -10,10 +10,13 @@ from typing import Any
 from pymavlink import mavutil
 
 from external_gps.mavlink_io import (
+    battery_remaining_percent,
     disable_sitl_mag_field_check,
+    request_land,
     send_gps_input,
     send_set_home,
     set_parameter,
+    update_state_from_message,
     verify_injected_point,
 )
 from external_gps.models import GpsFix, RuntimeState
@@ -23,6 +26,20 @@ from external_gps.models import GpsFix, RuntimeState
 class ParamValueMessage:
     param_id: str
     param_value: float
+
+
+class SimpleMessage:
+    def __init__(self, msg_type: str, **fields: Any) -> None:
+        self._msg_type = msg_type
+        self._fields = dict(fields)
+        for key, value in fields.items():
+            setattr(self, key, value)
+
+    def get_type(self) -> str:
+        return self._msg_type
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"mavpackettype": self._msg_type, **self._fields}
 
 
 class FakeMav:
@@ -83,6 +100,19 @@ class MavlinkIoTests(unittest.TestCase):
         self.assertEqual(args[11], 372000000)
         self.assertEqual(args[12], 50.0)
 
+    def test_request_land_uses_nav_land_command(self) -> None:
+        master = FakeMaster()
+
+        request_land(master)
+
+        assert master.mav.command_int_args is not None
+        args = master.mav.command_int_args
+        self.assertEqual(args[2], mavutil.mavlink.MAV_FRAME_GLOBAL)
+        self.assertEqual(args[3], mavutil.mavlink.MAV_CMD_NAV_LAND)
+        self.assertEqual(args[10], 0)
+        self.assertEqual(args[11], 0)
+        self.assertEqual(args[12], 0.0)
+
     def test_set_parameter_returns_acknowledged_value(self) -> None:
         master = FakeMaster([ParamValueMessage(param_id="GPS1_TYPE", param_value=14.0)])
 
@@ -111,8 +141,24 @@ class MavlinkIoTests(unittest.TestCase):
         self.assertIsNotNone(distance)
         self.assertTrue(state.injected_point_verified)
 
+    def test_update_state_records_battery_percent_from_sys_status(self) -> None:
+        state = RuntimeState()
+
+        update_state_from_message(FakeMaster(), state, SimpleMessage("SYS_STATUS", battery_remaining=9), _NullLogger())
+
+        self.assertEqual(state.last_battery_remaining_percent, 9)
+        self.assertEqual(state.last_battery_message_type, "SYS_STATUS")
+
+    def test_battery_remaining_percent_ignores_unknown_values(self) -> None:
+        self.assertIsNone(battery_remaining_percent(SimpleMessage("BATTERY_STATUS", battery_remaining=-1)))
+        self.assertIsNone(battery_remaining_percent(SimpleMessage("BATTERY_STATUS", battery_remaining=101)))
+        self.assertIsNone(battery_remaining_percent(SimpleMessage("BATTERY_STATUS")))
+
 
 class _NullLogger:
+    def info(self, *args: Any) -> None:
+        return None
+
     def warning(self, *args: Any) -> None:
         return None
 

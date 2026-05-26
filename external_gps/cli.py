@@ -7,9 +7,7 @@ import argparse
 import logging
 import signal
 import sys
-import time
 from pathlib import Path
-from typing import Callable
 
 from pymavlink import mavutil
 
@@ -17,10 +15,7 @@ from external_gps.mavlink_io import (
     configure_sitl_for_gps_input,
     disable_sitl_mag_field_check,
     maybe_request_data_stream,
-    read_pending_messages,
-    send_gps_input,
     send_set_home,
-    verify_injected_point,
 )
 from external_gps.models import GpsFix, RandomPointConfig, RuntimeState, gps_input_payload
 from external_gps.providers import (
@@ -31,6 +26,7 @@ from external_gps.providers import (
     StaticGpsProvider,
 )
 from external_gps.recorder import MavlinkJsonlRecorder
+from external_gps.runtime import run_loop, summary_text
 
 
 def build_logger(level: str) -> logging.Logger:
@@ -47,6 +43,16 @@ def build_logger(level: str) -> logging.Logger:
     )
     logger.addHandler(handler)
     return logger
+
+
+def battery_percent_arg(value: str) -> int:
+    try:
+        percent = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer from 0 to 100") from exc
+    if not 0 <= percent <= 100:
+        raise argparse.ArgumentTypeError("must be in [0, 100]; 0 disables the battery LAND action")
+    return percent
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -81,6 +87,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--set-home", action="store_true", help="Send MAV_CMD_DO_SET_HOME for the selected point.")
     parser.add_argument("--verify-after", type=float, default=8.0, help="Seconds before warning if point is not accepted.")
     parser.add_argument("--verify-tolerance-m", type=float, default=10.0, help="GPS_RAW_INT distance accepted as matching.")
+    parser.add_argument(
+        "--critical-battery-percent",
+        type=battery_percent_arg,
+        default=0,
+        help="Request LAND when MAVLink battery_remaining is <= this percent. 0 disables.",
+    )
 
     parser.add_argument("--mavlink-log", type=Path, default=Path("logs/mavlink_messages.jsonl"), help="JSONL log path.")
     parser.add_argument("--mavlink-log-flush-every", type=int, default=1, help="Flush JSONL after N records.")
@@ -172,74 +184,3 @@ def main(argv: list[str] | None = None) -> None:
 def log_start(recorder: MavlinkJsonlRecorder, args: argparse.Namespace, fix: GpsFix) -> None:
     recorder.write_event("SCRIPT_STARTED", {"args": vars(args)})
     recorder.write_event("SELECTED_POINT", gps_input_payload(fix))
-
-
-def run_loop(
-    args: argparse.Namespace,
-    master: object,
-    provider: GpsProvider,
-    state: RuntimeState,
-    recorder: MavlinkJsonlRecorder,
-    logger: logging.Logger,
-    should_stop_getter: Callable[[], bool],
-) -> None:
-    started_at = time.monotonic()
-    last_send_monotonic = 0.0
-    last_summary_monotonic = 0.0
-
-    while not should_stop_getter():
-        now = time.monotonic()
-        processed = read_pending_messages(master, state, recorder, logger)
-        if processed and args.log_level == "DEBUG":
-            logger.debug("Processed %s MAVLink messages", processed)
-
-        if now - last_send_monotonic >= args.interval:
-            fix = provider.current_fix(now)
-            send_gps_input(master, fix)
-            recorder.write_outgoing_gps_input(fix)
-            state.gps_messages_sent += 1
-            last_send_monotonic = now
-
-        maybe_report_verification(args, provider.start_fix, state, logger, now - started_at)
-
-        if now - last_summary_monotonic >= args.summary_every:
-            logger.info(summary_text(state))
-            last_summary_monotonic = now
-
-        time.sleep(0.01)
-
-    recorder.write_event(
-        "SCRIPT_STOPPED",
-        {"messages_received": state.messages_received, "gps_messages_sent": state.gps_messages_sent},
-    )
-
-
-def maybe_report_verification(
-    args: argparse.Namespace,
-    expected: GpsFix,
-    state: RuntimeState,
-    logger: logging.Logger,
-    elapsed_s: float,
-) -> None:
-    distance = verify_injected_point(state, expected, args.verify_tolerance_m)
-    if state.injected_point_verified:
-        return
-    if elapsed_s < args.verify_after or state.injected_point_warning_sent:
-        return
-
-    if distance is None:
-        logger.warning("ArduPilot has not reported a usable GPS_RAW_INT yet.")
-    else:
-        logger.warning(
-            "ArduPilot GPS_RAW_INT is %.1fm from the injected point. Use --configure-sitl-gps-input and restart SITL.",
-            distance,
-        )
-    state.injected_point_warning_sent = True
-
-
-def summary_text(state: RuntimeState) -> str:
-    return (
-        f"state armed={state.armed} mode={state.flight_mode} rx={state.messages_received} "
-        f"tx_gps={state.gps_messages_sent} global_position={'yes' if state.last_global_position else 'no'} "
-        f"gps_raw={'yes' if state.last_gps_raw else 'no'} simstate={'yes' if state.last_simstate else 'no'}"
-    )

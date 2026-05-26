@@ -42,7 +42,7 @@ class RandomPointConfig:
 
 @dataclass(slots=True)
 class RuntimeState:
-    """Small state cache for diagnostics only."""
+    """Small state cache for diagnostics and runtime safety decisions."""
 
     armed: bool = False
     flight_mode: str | None = None
@@ -52,8 +52,11 @@ class RuntimeState:
     last_global_position: dict[str, Any] | None = None
     last_gps_raw: dict[str, Any] | None = None
     last_simstate: dict[str, Any] | None = None
+    last_battery_remaining_percent: int | None = None
+    last_battery_message_type: str | None = None
     injected_point_verified: bool = False
     injected_point_warning_sent: bool = False
+    low_battery_landing_requested: bool = False
 
 
 def validate_lat_lon(lat: float, lon: float) -> None:

@@ -10,6 +10,7 @@ from typing import Any
 
 from pymavlink import mavutil
 
+from external_gps.battery import battery_remaining_percent
 from external_gps.message_utils import safe_message_dict, safe_message_type
 from external_gps.models import GpsFix, RuntimeState, distance_m, gps_week_and_ms, validate_fix
 from external_gps.recorder import MavlinkJsonlRecorder
@@ -72,6 +73,25 @@ def send_set_home(master: Any, fix: GpsFix) -> None:
         int(fix.lat * 1e7),
         int(fix.lon * 1e7),
         float(fix.alt_m),
+    )
+
+
+def request_land(master: Any) -> None:
+    """Ask ArduCopter to switch to LAND, which stops the active AUTO mission."""
+    master.mav.command_int_send(
+        master.target_system,
+        master.target_component,
+        mavutil.mavlink.MAV_FRAME_GLOBAL,
+        mavutil.mavlink.MAV_CMD_NAV_LAND,
+        0,
+        0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0,
+        0,
+        0.0,
     )
 
 
@@ -181,10 +201,23 @@ def update_state_from_message(master: Any, state: RuntimeState, msg: Any, logger
         state.last_simstate = safe_message_dict(msg)
         return
 
+    if msg_type in {"SYS_STATUS", "BATTERY_STATUS"}:
+        update_battery_state_from_message(state, msg_type, msg)
+        return
+
     if msg_type == "STATUSTEXT":
         text = getattr(msg, "text", "")
         if text:
             logger.info("STATUSTEXT: %s", text)
+
+
+def update_battery_state_from_message(state: RuntimeState, msg_type: str, msg: Any) -> None:
+    remaining_percent = battery_remaining_percent(msg)
+    if remaining_percent is None:
+        return
+
+    state.last_battery_remaining_percent = remaining_percent
+    state.last_battery_message_type = msg_type
 
 
 def verify_injected_point(state: RuntimeState, expected: GpsFix, tolerance_m: float) -> float | None:

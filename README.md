@@ -39,8 +39,17 @@ Tools/autotest/sim_vehicle.py \
   --random-radius-max 300 \
   --random-seed 42 \
   --configure-sitl-gps-input \
-  --set-home
+  --set-home \
+  --critical-battery-percent 10
 ```
+
+Вариант через Docker Compose из корня проекта:
+
+```sh
+docker compose up --build
+```
+
+Compose слушает UDP `14560`, монтирует `./logs` в контейнер и по умолчанию включает `--critical-battery-percent 10`. Для SITL оставь `sim_vehicle.py` с `--out=udp:127.0.0.1:14560`; параметры координат и порог батареи можно менять в `docker-compose.yml`.
 
 Если `GPS1_TYPE` или `SIM_GPS1_ENABLE` изменились, перезапусти SITL один раз и запусти ту же команду снова с тем же `--random-seed`. Дождись, пока в консоли появится `Selected injected point`, а QGroundControl покажет аппарат рядом с этой координатой. После этого создай и загрузи миссию в QGroundControl вокруг этой точки и оставь helper-скрипт работать во время режима `AUTO`.
 
@@ -54,6 +63,8 @@ Tools/autotest/sim_vehicle.py \
 ### Проверка
 
 Helper предупреждает, если ArduPilot сообщает позицию `GPS_RAW_INT`, которая находится слишком далеко от injected-точки. В таком случае убедись, что в SITL установлены `GPS1_TYPE=14` и `SIM_GPS1_ENABLE=0`, затем перезапусти SITL.
+
+Опция `--critical-battery-percent N` включает аварийное действие по батарее: когда `SYS_STATUS` или `BATTERY_STATUS` сообщает `battery_remaining <= N`, helper отправляет `MAV_CMD_NAV_LAND`. Для ArduCopter это переводит аппарат в режим `LAND` и останавливает продолжение `AUTO`-миссии. Значение `0` отключает это действие. После команды посадки helper продолжает отправлять `GPS_INPUT`, чтобы не отбирать внешний GPS во время снижения.
 
 ### Troubleshooting
 
