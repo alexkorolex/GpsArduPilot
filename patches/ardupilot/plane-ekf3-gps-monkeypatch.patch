@@ -1,0 +1,708 @@
+diff --git a/libraries/AP_NavEKF3/AP_NavEKF3.cpp b/libraries/AP_NavEKF3/AP_NavEKF3.cpp
+index e74c0395de..5e961da689 100644
+--- a/libraries/AP_NavEKF3/AP_NavEKF3.cpp
++++ b/libraries/AP_NavEKF3/AP_NavEKF3.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include <GCS_MAVLink/GCS.h>
+ #include <AP_Logger/AP_Logger.h>
++#include <AP_Common/AP_FWVersion.h>
+ #include <AP_Vehicle/AP_Vehicle_Type.h>
+ #include <AP_BoardConfig/AP_BoardConfig.h>
+ 
+@@ -744,6 +745,60 @@ const AP_Param::GroupInfo NavEKF3::var_info2[] = {
+     // @User: Advanced
+     AP_GROUPINFO("OPTIONS",  11, NavEKF3, _options, 0),
+ 
++    // @Param{Plane}: MP_TYPE
++    // @DisplayName: Plane GPS monkeypatch mode
++    // @Description: Controls Plane-only EKF3 GPS location monkeypatching before the GPS measurement is fused. Disabled leaves GPS unchanged. Fixed maps the first valid GPS fix to EK3_MP_LAT, EK3_MP_LNG and EK3_MP_ALT. Random maps the first valid GPS fix to a deterministic random point around that base location and keeps subsequent GPS movement relative to that fake origin.
++    // @Values: 0:Disabled,1:Fixed,2:Random
++    // @User: Advanced
++    AP_GROUPINFO_FRAME("MP_TYPE", 12, NavEKF3, _mp_type, 0, AP_PARAM_FRAME_PLANE),
++
++    // @Param{Plane}: MP_LAT
++    // @DisplayName: Plane GPS monkeypatch base latitude
++    // @Description: Base latitude in degrees for Plane-only EKF3 GPS monkeypatching. The monkeypatch is ignored if both latitude and longitude are zero.
++    // @Range: -90 90
++    // @User: Advanced
++    // @Units: deg
++    AP_GROUPINFO_FRAME("MP_LAT", 13, NavEKF3, _mp_lat, 0.0f, AP_PARAM_FRAME_PLANE),
++
++    // @Param{Plane}: MP_LNG
++    // @DisplayName: Plane GPS monkeypatch base longitude
++    // @Description: Base longitude in degrees for Plane-only EKF3 GPS monkeypatching. The monkeypatch is ignored if both latitude and longitude are zero.
++    // @Range: -180 180
++    // @User: Advanced
++    // @Units: deg
++    AP_GROUPINFO_FRAME("MP_LNG", 14, NavEKF3, _mp_lng, 0.0f, AP_PARAM_FRAME_PLANE),
++
++    // @Param{Plane}: MP_ALT
++    // @DisplayName: Plane GPS monkeypatch base altitude
++    // @Description: Base AMSL altitude in metres for Plane-only EKF3 GPS monkeypatching.
++    // @Range: -1000 83000
++    // @User: Advanced
++    // @Units: m
++    AP_GROUPINFO_FRAME("MP_ALT", 15, NavEKF3, _mp_alt_m, 0.0f, AP_PARAM_FRAME_PLANE),
++
++    // @Param{Plane}: MP_RAD_MIN
++    // @DisplayName: Plane GPS monkeypatch minimum random radius
++    // @Description: Minimum random offset radius in metres around EK3_MP_LAT and EK3_MP_LNG when EK3_MP_TYPE is Random.
++    // @Range: 0 50000
++    // @User: Advanced
++    // @Units: m
++    AP_GROUPINFO_FRAME("MP_RAD_MIN", 16, NavEKF3, _mp_radius_min_m, 0.0f, AP_PARAM_FRAME_PLANE),
++
++    // @Param{Plane}: MP_RAD_MAX
++    // @DisplayName: Plane GPS monkeypatch maximum random radius
++    // @Description: Maximum random offset radius in metres around EK3_MP_LAT and EK3_MP_LNG when EK3_MP_TYPE is Random. The monkeypatch is ignored if this is smaller than EK3_MP_RAD_MIN.
++    // @Range: 0 50000
++    // @User: Advanced
++    // @Units: m
++    AP_GROUPINFO_FRAME("MP_RAD_MAX", 17, NavEKF3, _mp_radius_max_m, 0.0f, AP_PARAM_FRAME_PLANE),
++
++    // @Param{Plane}: MP_SEED
++    // @DisplayName: Plane GPS monkeypatch random seed
++    // @Description: Deterministic seed used to select the random point when EK3_MP_TYPE is Random. Changing the seed changes the selected fake start point.
++    // @Range: -2147483648 2147483647
++    // @User: Advanced
++    AP_GROUPINFO_FRAME("MP_SEED", 18, NavEKF3, _mp_seed, 1, AP_PARAM_FRAME_PLANE),
++
+     AP_GROUPEND
+ };
+ 
+@@ -754,6 +809,100 @@ NavEKF3::NavEKF3() :
+     AP_Param::setup_object_defaults(this, var_info2);
+ }
+ 
++uint32_t NavEKF3::gps_monkeypatch_next(uint32_t &state)
++{
++    if (state == 0) {
++        state = 0x9E3779B9U;
++    }
++    state ^= state << 13;
++    state ^= state >> 17;
++    state ^= state << 5;
++    return state;
++}
++
++float NavEKF3::gps_monkeypatch_unit_random(uint32_t &state)
++{
++    return (gps_monkeypatch_next(state) >> 8) * (1.0f / 16777216.0f);
++}
++
++bool NavEKF3::gps_monkeypatch_target(Location &target) const
++{
++    if (AP::fwversion().vehicle_type != APM_BUILD_ArduPlane) {
++        return false;
++    }
++
++    const auto type = static_cast<GPSMonkeyPatchType>(int8_t(_mp_type.get()));
++    if (type == GPSMonkeyPatchType::Disabled) {
++        return false;
++    }
++
++    const float lat_deg = _mp_lat.get();
++    const float lng_deg = _mp_lng.get();
++    const float alt_m = _mp_alt_m.get();
++    if (!isfinite(lat_deg) || !isfinite(lng_deg) || !isfinite(alt_m) ||
++        fabsF(alt_m) > LOCATION_ALT_MAX_M) {
++        return false;
++    }
++
++    target = Location(int32_t(lat_deg * 1.0e7f),
++                      int32_t(lng_deg * 1.0e7f),
++                      int32_t(alt_m * 100.0f),
++                      Location::AltFrame::ABSOLUTE);
++    if (!target.check_latlng() || (target.lat == 0 && target.lng == 0)) {
++        return false;
++    }
++
++    if (type == GPSMonkeyPatchType::Fixed) {
++        return true;
++    }
++
++    if (type != GPSMonkeyPatchType::Random) {
++        return false;
++    }
++
++    const float radius_min_m = _mp_radius_min_m.get();
++    const float radius_max_m = _mp_radius_max_m.get();
++    if (!isfinite(radius_min_m) || !isfinite(radius_max_m) ||
++        is_negative(radius_min_m) || is_negative(radius_max_m) ||
++        radius_min_m > radius_max_m) {
++        return false;
++    }
++
++    if (is_zero(radius_max_m)) {
++        return true;
++    }
++
++    uint32_t state = uint32_t(_mp_seed.get());
++    const float radius_sq = sq(radius_min_m) +
++        gps_monkeypatch_unit_random(state) * (sq(radius_max_m) - sq(radius_min_m));
++    const float radius_m = sqrtF(radius_sq);
++    const float bearing_rad = (2.0f * M_PI) * gps_monkeypatch_unit_random(state);
++    target.offset(cosF(bearing_rad) * radius_m, sinF(bearing_rad) * radius_m);
++    return target.check_latlng();
++}
++
++bool NavEKF3::apply_gps_monkeypatch(Location &loc)
++{
++    Location fake_origin;
++    if (!gps_monkeypatch_target(fake_origin)) {
++        _mp_origin_valid = false;
++        return false;
++    }
++
++    if (!_mp_origin_valid || !_mp_fake_origin.same_loc_as(fake_origin)) {
++        _mp_raw_origin = loc;
++        _mp_fake_origin = fake_origin;
++        _mp_origin_valid = true;
++    }
++
++    const Vector2p offset_ne = _mp_raw_origin.get_distance_NE_postype(loc);
++    const int32_t alt_delta_cm = loc.alt - _mp_raw_origin.alt;
++    loc = _mp_fake_origin;
++    loc.offset(offset_ne.x, offset_ne.y);
++    loc.set_alt_cm(_mp_fake_origin.alt + alt_delta_cm, Location::AltFrame::ABSOLUTE);
++    return true;
++}
++
+ 
+ // Initialise the filter
+ bool NavEKF3::InitialiseFilter(void)
+diff --git a/libraries/AP_NavEKF3/AP_NavEKF3.h b/libraries/AP_NavEKF3/AP_NavEKF3.h
+index ddb89547a9..9fce18c7eb 100644
+--- a/libraries/AP_NavEKF3/AP_NavEKF3.h
++++ b/libraries/AP_NavEKF3/AP_NavEKF3.h
+@@ -405,6 +405,17 @@ private:
+         NONE = 3
+     };
+ 
++    enum class GPSMonkeyPatchType {
++        Disabled = 0,
++        Fixed = 1,
++        Random = 2,
++    };
++
++    bool apply_gps_monkeypatch(Location &loc);
++    bool gps_monkeypatch_target(Location &target) const;
++    static uint32_t gps_monkeypatch_next(uint32_t &state);
++    static float gps_monkeypatch_unit_random(uint32_t &state);
++
+     // EKF Mavlink Tuneable Parameters
+     AP_Int8  _enable;               // zero to disable EKF3
+     AP_Float _gpsHorizVelNoise;     // GPS horizontal velocity measurement noise : m/s
+@@ -473,6 +484,16 @@ private:
+     AP_Enum<LogLevel> _log_level;   // log verbosity level
+     AP_Float _gpsVAccThreshold;     // vertical accuracy threshold to use GPS as an altitude source
+     AP_Int32 _options;              // bit mask of processing options
++    AP_Int8 _mp_type;               // Plane GPS monkeypatch mode
++    AP_Float _mp_lat;               // Plane GPS monkeypatch base latitude in degrees
++    AP_Float _mp_lng;               // Plane GPS monkeypatch base longitude in degrees
++    AP_Float _mp_alt_m;             // Plane GPS monkeypatch base AMSL altitude in metres
++    AP_Float _mp_radius_min_m;      // Plane GPS monkeypatch random minimum radius in metres
++    AP_Float _mp_radius_max_m;      // Plane GPS monkeypatch random maximum radius in metres
++    AP_Int32 _mp_seed;              // Plane GPS monkeypatch deterministic random seed
++    Location _mp_raw_origin;
++    Location _mp_fake_origin;
++    bool _mp_origin_valid = false;
+ 
+     // enum for processing options
+     enum class Option {
+diff --git a/libraries/AP_NavEKF3/AP_NavEKF3_Measurements.cpp b/libraries/AP_NavEKF3/AP_NavEKF3_Measurements.cpp
+index 6dfe056290..1677462b16 100644
+--- a/libraries/AP_NavEKF3/AP_NavEKF3_Measurements.cpp
++++ b/libraries/AP_NavEKF3/AP_NavEKF3_Measurements.cpp
+@@ -681,7 +681,8 @@ void NavEKF3_core::readGpsData()
+     calcGpsGoodForFlight();
+ 
+     // Read the GPS location in WGS-84 lat,long,height coordinates
+-    const Location &gpsloc = gps.location(selected_gps);
++    Location gpsloc = gps.location(selected_gps);
++    frontend->apply_gps_monkeypatch(gpsloc);
+ 
+     // Set the EKF origin and magnetic field declination if not previously set and GPS checks have passed
+     if (gpsGoodToAlign && !validOrigin) {
+diff --git a/docs/plane-ekf3-gps-monkeypatch.md b/docs/plane-ekf3-gps-monkeypatch.md
+new file mode 100644
+index 0000000000..c3cde99a15
+--- /dev/null
++++ b/docs/plane-ekf3-gps-monkeypatch.md
+@@ -0,0 +1,475 @@
++# Plane EKF3 GPS Monkeypatch
++
++Этот документ описывает прошивочную замену прежнего Python-скрипта для подмены GPS-точки. Теперь координата меняется внутри ArduPilot, в модуле `AP_NavEKF3`, до того как EKF3 устанавливает origin и начинает fusion GPS-измерений.
++
++Реализация предназначена для ArduPlane. Copter/Rover/Sub не должны получать это поведение: параметры помечены как Plane-only, а runtime-код дополнительно проверяет тип прошивки.
++
++## Задача
++
++Нужно было сохранить поведение Python-скрипта:
++
++- задать фиксированную или случайную точку;
++- передать эту точку в навигационную цепочку ArduPilot;
++- видеть дрон в QGroundControl в новой географии;
++- строить и запускать mission в QGroundControl вокруг этой fake-точки;
++- не трогать Copter и другие vehicle-типы.
++
++Главное отличие от Python-варианта: теперь мы не отправляем `GPS_INPUT` через MAVLink. Вместо этого ArduPilot берет обычный SITL GPS, а EKF3 получает уже подмененную `Location`.
++
++## Измененные файлы
++
++### `libraries/AP_NavEKF3/AP_NavEKF3_Measurements.cpp`
++
++Изменение находится в `NavEKF3_core::readGpsData()`.
++
++Было:
++
++```cpp
++const Location &gpsloc = gps.location(selected_gps);
++```
++
++Стало:
++
++```cpp
++Location gpsloc = gps.location(selected_gps);
++frontend->apply_gps_monkeypatch(gpsloc);
++```
++
++Зачем:
++
++- raw GPS location теперь копируется в локальную переменную;
++- monkeypatch может изменить `lat/lng/alt`;
++- дальше этот `gpsloc` используется для:
++  - установки EKF origin;
++  - установки earth magnetic field location;
++  - записи GPS measurement в `storedGPS`;
++  - последующего GPS fusion.
++
++Это ключевая точка, потому что она стоит до:
++
++- `setOriginLLH()`;
++- `setEarthFieldFromLocation()`;
++- `gpsDataNew.lat/lng/hgt`;
++- `storedGPS.push(gpsDataNew)`.
++
++### `libraries/AP_NavEKF3/AP_NavEKF3.cpp`
++
++Добавлены параметры `EK3_MP_*` в `NavEKF3::var_info2[]`.
++
++Почему `var_info2[]`:
++
++- основной `var_info[]` уже использует `AP_SUBGROUPEXTENSION`;
++- `var_info2[]` создан именно для расширения списка параметров EKF3;
++- новые индексы `12..18` не сдвигают старые параметры.
++
++Также добавлены helper-методы:
++
++- `gps_monkeypatch_target()`
++  - проверяет, что прошивка именно ArduPlane;
++  - читает `EK3_MP_*`;
++  - валидирует latitude/longitude/altitude/radius;
++  - рассчитывает fixed или deterministic random fake origin.
++
++- `apply_gps_monkeypatch()`
++  - получает raw GPS location;
++  - при первом валидном вызове сохраняет raw origin и fake origin;
++  - для следующих точек переносит локальное смещение raw GPS в fake-географию.
++
++- `gps_monkeypatch_next()` и `gps_monkeypatch_unit_random()`
++  - маленький deterministic PRNG;
++  - нужен, чтобы одинаковый `EK3_MP_SEED` всегда давал одинаковую random-точку.
++
++### `libraries/AP_NavEKF3/AP_NavEKF3.h`
++
++Добавлены поля состояния и объявления helper-методов:
++
++- параметры `AP_Int8`, `AP_Float`, `AP_Int32`;
++- сохраненный raw origin;
++- сохраненный fake origin;
++- флаг валидности origin.
++
++Важно: `APM_BUILD_TYPE()` не используется в header. В ArduPilot этот macro нельзя безопасно вызывать из публичного header, если `APM_BUILD_DIRECTORY` еще не определен. Поэтому защита сделана через:
++
++- `AP_GROUPINFO_FRAME(..., AP_PARAM_FRAME_PLANE)` для параметров;
++- runtime-check `AP::fwversion().vehicle_type != APM_BUILD_ArduPlane` внутри monkeypatch-кода.
++
++## Как работает алгоритм
++
++### Disabled
++
++Если:
++
++```text
++EK3_MP_TYPE = 0
++```
++
++то `gpsloc` не меняется. EKF3 работает как обычный ArduPlane.
++
++### Fixed
++
++Если:
++
++```text
++EK3_MP_TYPE = 1
++```
++
++то первый валидный GPS fix переносится в точку:
++
++```text
++EK3_MP_LAT
++EK3_MP_LNG
++EK3_MP_ALT
++```
++
++Дальше все движение считается относительно этой fake-точки.
++
++Пример:
++
++```text
++raw origin       = 47.397742, 8.545594
++fake origin      = 55.752200, 37.615600
++raw current      = raw origin + 100 m north
++patched current  = fake origin + 100 m north
++```
++
++### Random
++
++Если:
++
++```text
++EK3_MP_TYPE = 2
++```
++
++то fake origin выбирается случайно вокруг базовой точки:
++
++```text
++EK3_MP_LAT
++EK3_MP_LNG
++EK3_MP_ALT
++```
++
++Радиус выбирается в диапазоне:
++
++```text
++EK3_MP_RAD_MIN .. EK3_MP_RAD_MAX
++```
++
++Random детерминированный:
++
++```text
++EK3_MP_SEED = 42
++```
++
++всегда даст одну и ту же точку при тех же `EK3_MP_*`.
++
++## Параметры monkeypatch
++
++| Параметр | Тип | Значение |
++| --- | --- | --- |
++| `EK3_MP_TYPE` | int | `0` off, `1` fixed, `2` random |
++| `EK3_MP_LAT` | float degrees | базовая latitude |
++| `EK3_MP_LNG` | float degrees | базовая longitude |
++| `EK3_MP_ALT` | float metres | базовая AMSL altitude |
++| `EK3_MP_RAD_MIN` | float metres | минимальный random radius |
++| `EK3_MP_RAD_MAX` | float metres | максимальный random radius |
++| `EK3_MP_SEED` | int | seed для deterministic random |
++
++Проверки валидности:
++
++- если `EK3_MP_TYPE=0`, monkeypatch выключен;
++- если `EK3_MP_LAT=0` и `EK3_MP_LNG=0`, monkeypatch не применяется;
++- если координаты вне диапазона latitude/longitude, monkeypatch не применяется;
++- если altitude не finite или больше `LOCATION_ALT_MAX_M`, monkeypatch не применяется;
++- если `EK3_MP_RAD_MAX < EK3_MP_RAD_MIN`, random monkeypatch не применяется;
++- если `EK3_MP_RAD_MAX=0`, random-режим фактически совпадает с fixed по базовой точке.
++
++## Связанные параметры ArduPilot
++
++Эти параметры не добавлены monkeypatch-патчем, но нужны для корректного теста.
++
++| Параметр | Рекомендуемо для SITL | Зачем |
++| --- | --- | --- |
++| `AHRS_EKF_TYPE` | `3` | использовать EKF3 для AHRS/navigation |
++| `EK3_ENABLE` | `1` | включить EKF3 |
++| `SIM_GPS1_FIXTYPE` | `3` | обычный 3D GPS fix вместо RTK fixed |
++| `RTL_AUTOLAND` | `3` при наличии `DO_LAND_START` | убрать arming error с landing sequence |
++
++## GPS Lock в QGroundControl
++
++На скриншоте QGroundControl показывает:
++
++```text
++GPS Lock: 3D RTK GPS Lock (fixed)
++```
++
++Это не наш monkeypatch и не ошибка подмены координат. Это статус raw SITL GPS.
++
++В ArduPilot/MAVLink fix type такой:
++
++| Значение | Meaning |
++| --- | --- |
++| `0` | No GPS connected |
++| `1` | No Fix / None |
++| `2` | 2D Fix |
++| `3` | 3D Fix |
++| `4` | DGPS |
++| `5` | RTK Float |
++| `6` | RTK Fixed |
++
++В SITL default сейчас:
++
++```text
++SIM_GPS1_FIXTYPE = 6
++```
++
++поэтому QGC и пишет `3D RTK GPS Lock (fixed)`.
++
++Чтобы QGC показывал обычный GPS, а не RTK:
++
++```text
++param set SIM_GPS1_FIXTYPE 3
++reboot
++```
++
++После этого ожидаемый статус будет примерно:
++
++```text
++GPS Lock: 3D GPS Lock
++```
++
++### Почему не `None`
++
++`None` означает:
++
++```text
++SIM_GPS1_FIXTYPE = 1
++```
++
++То есть GPS сообщения есть, но GPS lock отсутствует.
++
++Для текущей реализации это ломает задачу. В `readGpsData()` EKF3 до monkeypatch делает проверку:
++
++```cpp
++if (gps.status(selected_gps) < AP_GPS_FixType::FIX_3D) {
++    return;
++}
++```
++
++Если выставить `None`, EKF3 не получит GPS measurement, не выставит нормальный origin и Plane не сможет стабильно лететь обычную GPS mission в `AUTO`.
++
++Итог:
++
++- если нужно летать mission в QGC, нужен минимум `SIM_GPS1_FIXTYPE=3`;
++- `SIM_GPS1_FIXTYPE=6` тоже работает, но QGC пишет RTK fixed;
++- `SIM_GPS1_FIXTYPE=1` даст `None`, но mission flight через GPS/EKF3 работать не будет.
++
++Если когда-нибудь потребуется именно косметически показывать `None` в QGC, но при этом продолжать лететь по EKF/GPS, это уже отдельный патч в MAVLink reporting layer. Сейчас он не реализован, потому что это будет скрывать реальное состояние GPS от GCS и может путать prearm/failsafe-диагностику.
++
++## Запуск SITL
++
++Из директории `ardupilot`:
++
++```bash
++PATH=/Users/admin/Documents/ardupilot-dev/.venv/bin:$PATH \
++../.venv/bin/python ./Tools/autotest/sim_vehicle.py \
++  -v ArduPlane \
++  -f plane \
++  -w \
++  --custom-location=55.7522,37.6156,180,0
++```
++
++`--console --map` можно не добавлять, если используется QGroundControl. QGC подключается к SITL через UDP `127.0.0.1:14550`.
++
++Если нужно пересобрать вручную:
++
++```bash
++../.venv/bin/python ./waf configure --board sitl
++../.venv/bin/python ./waf plane
++```
++
++## Настройка в MAVProxy
++
++Минимальный fixed-режим:
++
++```text
++param set AHRS_EKF_TYPE 3
++param set EK3_ENABLE 1
++param set SIM_GPS1_FIXTYPE 3
++
++param set EK3_MP_TYPE 1
++param set EK3_MP_LAT 55.7522
++param set EK3_MP_LNG 37.6156
++param set EK3_MP_ALT 180
++
++reboot
++```
++
++Random-режим:
++
++```text
++param set AHRS_EKF_TYPE 3
++param set EK3_ENABLE 1
++param set SIM_GPS1_FIXTYPE 3
++
++param set EK3_MP_TYPE 2
++param set EK3_MP_LAT 55.7522
++param set EK3_MP_LNG 37.6156
++param set EK3_MP_ALT 180
++param set EK3_MP_RAD_MIN 0
++param set EK3_MP_RAD_MAX 300
++param set EK3_MP_SEED 42
++
++reboot
++```
++
++Отключить monkeypatch:
++
++```text
++param set EK3_MP_TYPE 0
++reboot
++```
++
++## Настройка mission в QGroundControl
++
++Для первого теста лучше не использовать landing pattern.
++
++Рекомендуемый простой маршрут:
++
++```text
++Takeoff 100 m
++Waypoint 1, 300-500 m от старта
++Waypoint 2, 300-500 m от WP1
++RTL
++```
++
++Почему не ставить точки рядом:
++
++- Plane не может висеть на месте;
++- если waypoint слишком близко, самолет будет постоянно разворачиваться;
++- если QGC добавляет `LOITER`, `LAND`, `DO_LAND_START`, визуально будет казаться, что самолет крутится вокруг точки.
++
++Запуск:
++
++```text
++mode AUTO
++arm throttle
++```
++
++или через QGroundControl action `Takeoff/Start Mission`, если arming checks чистые.
++
++## Что видно в QGroundControl
++
++Monkeypatch влияет на:
++
++- EKF origin;
++- EKF GPS fusion;
++- AHRS/global position;
++- `GLOBAL_POSITION_INT`;
++- позицию дрона на карте;
++- выполнение mission по fake-координатам.
++
++Monkeypatch не обязан менять:
++
++- raw GPS driver output;
++- GPS status panel;
++- количество спутников;
++- HDOP/VDOP;
++- raw GPS fix type.
++
++Поэтому нормально, если QGC показывает GPS satellites/fix type от SITL GPS, а сам дрон находится в fake-географии.
++
++## Troubleshooting
++
++### QGroundControl пишет, что отсутствуют `FS_OPTIONS`, `FS_GCS_TIMEOUT`, `FS_GCS_ENABLE`
++
++Это предупреждение QGroundControl о параметрах failsafe, которые он ожидает увидеть в firmware metadata. Для ArduPlane часть этих параметров называется иначе или отсутствует. Например, Plane использует:
++
++```text
++FS_GCS_ENABL
++```
++
++а не:
++
++```text
++FS_GCS_ENABLE
++```
++
++Это не связано с GPS monkeypatch и само по себе не блокирует mission.
++
++### `DO_LAND_START set and RTL_AUTOLAND disabled`
++
++Это реальная arming check ошибка Plane.
++
++В mission есть `DO_LAND_START`, но:
++
++```text
++RTL_AUTOLAND = 0
++```
++
++Варианты:
++
++1. Удалить `DO_LAND_START`/landing pattern из mission.
++2. Разрешить такую mission:
++
++```text
++param set RTL_AUTOLAND 3
++```
++
++`RTL_AUTOLAND=3` оставляет `DO_LAND_START` для go-around/landing sequence и убирает arming failure без включения обычного RTL autoland.
++
++### Самолет крутится вокруг точки
++
++Для Plane это часто нормально, если активен:
++
++- `LOITER`;
++- `LOITER_TIME`;
++- `LOITER_TURNS`;
++- landing pattern;
++- слишком близкий waypoint.
++
++Проверь:
++
++```text
++mode
++wp status
++wp list
++```
++
++Для простого теста используй mission без landing pattern и с waypoint на расстоянии `300-500 m`.
++
++### Compass / magnetic prearm
++
++Если fake-точка далеко от стартовой SITL-географии, могут появиться ошибки вида:
++
++```text
++PreArm: Check mag field
++```
++
++Лучше запускать SITL сразу рядом с fake-точкой:
++
++```bash
++--custom-location=55.7522,37.6156,180,0
++```
++
++Отключать arming checks стоит только для локальных SITL-тестов.
++
++## Проверка сборки
++
++Патч проверялся так:
++
++```bash
++../.venv/bin/python ./waf configure --board sitl
++../.venv/bin/python ./waf plane
++```
++
++Также проверялось наличие новых параметров в `arduplane`:
++
++```bash
++strings build/sitl/bin/arduplane | rg "MP_TYPE|MP_LAT|MP_LNG|MP_ALT|MP_RAD|MP_SEED"
++```
++
++## Документация ArduPilot
++
++- Parameters in libraries: https://ardupilot.org/dev/docs/code-overview-adding-a-new-parameter.html
++- Build process: https://ardupilot.org/dev/docs/building-the-code.html
++- SITL usage: https://ardupilot.org/dev/docs/using-sitl-for-ardupilot-testing.html

@@ -1,83 +1,140 @@
-## ArduPilot helper для случайного GPS_INPUT
+## ArduPlane EKF3 GPS Monkeypatch
 
-Этот проект — небольшой Python-слой вокруг ArduPilot SITL. Он выбирает GPS-точку, отправляет её в ArduPilot как `GPS_INPUT`, записывает MAVLink-трафик в JSONL и оставляет QGroundControl возможность напрямую загружать и запускать миссию.
+Этот проект хранит воспроизводимый monkeypatch для ArduPilot submodule. Патч добавляет в ArduPlane режим подмены GPS-точки внутри `AP_NavEKF3`, чтобы QGroundControl мог строить и запускать mission вокруг заданной или случайной fake-точки.
 
-Проект предназначен для экспериментов в SITL, а не для реальных аппаратов.
+Решение предназначено для SITL-экспериментов и проверки mission flow. Для реальных аппаратов его нужно отдельно ревьюить как изменение навигационной цепочки.
 
-### Что было сделано
+### Что здесь лежит
 
-* `main.py` — тонкая обёртка для запуска команд.
-* `external_gps/` содержит переиспользуемый код для GPS, MAVLink, логирования и CLI.
-* `tests/` содержит unit-тесты, которые запускаются без SITL.
+* `ardupilot/` — ArduPilot как submodule.
+* `patches/ardupilot/plane-ekf3-gps-monkeypatch.patch` — source of truth для firmware monkeypatch.
+* `scripts/apply-ardupilot-plane-ekf3-gps-monkeypatch.sh` — скрипт применения patch к submodule.
 
-Провайдер по умолчанию — `random-simstate`. Он выбирает одну случайную стартовую точку рядом с `--static-lat/--static-lon`, затем читает ArduPilot `SIMSTATE` и переносит движение SITL на эту случайную точку перед отправкой `GPS_INPUT`. Этот режим нужно использовать, когда ты хочешь создать миссию в QGroundControl вокруг выбранной точки и заставить симулированный дрон пролететь её.
+После применения patch внутри submodule появляется подробная документация:
 
-### Рабочий процесс SITL + QGroundControl
+```text
+ardupilot/docs/plane-ekf3-gps-monkeypatch.md
+```
 
-Терминал 1: запусти ArduCopter SITL и добавь MAVLink-выход для helper-скрипта:
+### Что делает patch
+
+Patch меняет только Plane-ветку поведения:
+
+* добавляет Plane-only параметры `EK3_MP_*`;
+* подменяет `Location` в `NavEKF3_core::readGpsData()` до установки EKF origin и GPS fusion;
+* поддерживает fixed-точку и deterministic random-точку вокруг базовой координаты;
+* не включает это поведение для Copter/Rover/Sub.
+
+### Применение
+
+Проверить состояние patch:
 
 ```sh
-cd ardupilot
+scripts/apply-ardupilot-plane-ekf3-gps-monkeypatch.sh --check
+```
+
+Наложить patch на чистый или обновленный `ardupilot` submodule:
+
+```sh
+scripts/apply-ardupilot-plane-ekf3-gps-monkeypatch.sh
+```
+
+Снять patch:
+
+```sh
+scripts/apply-ardupilot-plane-ekf3-gps-monkeypatch.sh --reverse
+```
+
+Скрипт идемпотентный: если patch уже применен, повторный запуск не меняет файлы.
+
+### Сборка ArduPlane SITL
+
+Из директории `ardupilot`:
+
+```sh
+./waf configure --board sitl
+./waf plane
+```
+
+Запуск SITL:
+
+```sh
 Tools/autotest/sim_vehicle.py \
-  -v ArduCopter \
-  -f quad \
-  --console \
-  --map \
-  --custom-location 55.0,37.0,180,0 \
-  --out=udp:127.0.0.1:14560
+  -v ArduPlane \
+  -f plane \
+  -w \
+  --custom-location=55.7522,37.6156,180,0
 ```
 
-Терминал 2: из корня проекта:
+QGroundControl подключается к SITL через UDP `127.0.0.1:14550`.
 
-```sh
-.venv/bin/python main.py \
-  --connect udpin:0.0.0.0:14560 \
-  --provider random-simstate \
-  --static-lat 55.0 \
-  --static-lon 37.0 \
-  --static-alt 180 \
-  --random-radius-max 300 \
-  --random-seed 42 \
-  --configure-sitl-gps-input \
-  --set-home \
-  --critical-battery-percent 10
+### Минимальная настройка
+
+Fixed-точка:
+
+```text
+param set AHRS_EKF_TYPE 3
+param set EK3_ENABLE 1
+param set SIM_GPS1_FIXTYPE 3
+
+param set EK3_MP_TYPE 1
+param set EK3_MP_LAT 55.7522
+param set EK3_MP_LNG 37.6156
+param set EK3_MP_ALT 180
+
+reboot
 ```
 
-Вариант через Docker Compose из корня проекта:
+Random-точка:
 
-```sh
-docker compose up --build
+```text
+param set AHRS_EKF_TYPE 3
+param set EK3_ENABLE 1
+param set SIM_GPS1_FIXTYPE 3
+
+param set EK3_MP_TYPE 2
+param set EK3_MP_LAT 55.7522
+param set EK3_MP_LNG 37.6156
+param set EK3_MP_ALT 180
+param set EK3_MP_RAD_MIN 0
+param set EK3_MP_RAD_MAX 300
+param set EK3_MP_SEED 42
+
+reboot
 ```
 
-Compose слушает UDP `14560`, монтирует `./logs` в контейнер и по умолчанию включает `--critical-battery-percent 10`. Для SITL оставь `sim_vehicle.py` с `--out=udp:127.0.0.1:14560`; параметры координат и порог батареи можно менять в `docker-compose.yml`.
+Отключить monkeypatch:
 
-Если `GPS1_TYPE` или `SIM_GPS1_ENABLE` изменились, перезапусти SITL один раз и запусти ту же команду снова с тем же `--random-seed`. Дождись, пока в консоли появится `Selected injected point`, а QGroundControl покажет аппарат рядом с этой координатой. После этого создай и загрузи миссию в QGroundControl вокруг этой точки и оставь helper-скрипт работать во время режима `AUTO`.
+```text
+param set EK3_MP_TYPE 0
+reboot
+```
 
-### Режимы провайдера
+### Mission в QGroundControl
 
-* `random-simstate`: рекомендуемый режим для тестов миссий QGroundControl в SITL.
-* `random-point`: выбирает одну случайную точку и удерживает её; полезно для быстрой проверки GPS/EKF, но не для полёта по миссии.
-* `static`: отправляет точные значения `--static-lat/--static-lon/--static-alt`.
-* `demo-line`: двигается с фиксированной северной/восточной скоростью для простых локальных тестов.
+Для первого теста лучше использовать простой маршрут без landing pattern:
+
+```text
+Takeoff 100 m
+Waypoint 1, 300-500 m от старта
+Waypoint 2, 300-500 m от WP1
+RTL
+```
+
+Plane не может висеть на месте, поэтому слишком близкие точки, `LOITER` или landing sequence могут выглядеть как вращение вокруг точки.
 
 ### Проверка
 
-Helper предупреждает, если ArduPilot сообщает позицию `GPS_RAW_INT`, которая находится слишком далеко от injected-точки. В таком случае убедись, что в SITL установлены `GPS1_TYPE=14` и `SIM_GPS1_ENABLE=0`, затем перезапусти SITL.
-
-Опция `--critical-battery-percent N` включает аварийное действие по батарее: когда `SYS_STATUS` или `BATTERY_STATUS` сообщает `battery_remaining <= N`, helper отправляет `MAV_CMD_NAV_LAND`. Для ArduCopter это переводит аппарат в режим `LAND` и останавливает продолжение `AUTO`-миссии. Значение `0` отключает это действие. После команды посадки helper продолжает отправлять `GPS_INPUT`, чтобы не отбирать внешний GPS во время снижения.
-
-### Troubleshooting
-
-`Got COMMAND_ACK: REQUEST_CAMERA_INFORMATION: UNSUPPORTED` — это QGroundControl запрашивает компонент камеры. Это не критично, если в этом тесте не нужна симулированная камера.
-
-`Got COMMAND_ACK: REQUEST_MESSAGE: ACCEPTED` — это нормально.
-
-`AP: EKF3 IMU0 is using GPS` и `AP: EKF3 IMU1 is using GPS` — хорошие признаки: EKF3 принял GPS-данные.
-
-`AP: PreArm: Check mag field (z diff:1026>200)` означает, что магнитное поле компаса в ArduPilot не совпадает с моделью магнитного поля Земли для текущей GPS-локации. С этим helper-скриптом это обычно происходит, когда SITL стартует в дефолтной локации `CMAC`, а `GPS_INPUT` смещён в другую часть мира. Лучше запускать SITL с `--custom-location` рядом с теми же `--static-lat/--static-lon`, которые используются helper-скриптом. Для локальных SITL-экспериментов можно также передать `--disable-sitl-mag-field-check`, который выставляет `ARMING_MAGTHRESH=0`.
-
-Запуск unit-тестов:
+Проверить, что параметры попали в собранный `arduplane`:
 
 ```sh
-.venv/bin/python -m unittest discover -v
+strings ardupilot/build/sitl/bin/arduplane | rg "MP_TYPE|MP_LAT|MP_LNG|MP_ALT|MP_RAD|MP_SEED"
 ```
+
+Быстрая проверка patch-состояния:
+
+```sh
+scripts/apply-ardupilot-plane-ekf3-gps-monkeypatch.sh --check
+```
+
+Полное описание алгоритма, параметров, QGroundControl статусов и troubleshooting находится в `ardupilot/docs/plane-ekf3-gps-monkeypatch.md`.
