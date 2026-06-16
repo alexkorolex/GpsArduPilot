@@ -1,0 +1,566 @@
+diff --git a/libraries/AP_NavEKF3/AP_NavEKF3.cpp b/libraries/AP_NavEKF3/AP_NavEKF3.cpp
+index e74c0395de..05635d82c7 100644
+--- a/libraries/AP_NavEKF3/AP_NavEKF3.cpp
++++ b/libraries/AP_NavEKF3/AP_NavEKF3.cpp
+@@ -744,6 +744,14 @@ const AP_Param::GroupInfo NavEKF3::var_info2[] = {
+     // @User: Advanced
+     AP_GROUPINFO("OPTIONS",  11, NavEKF3, _options, 0),
+ 
++    // @Param{Plane}: PLN_GPS
++    // @DisplayName: Plane EKF3 GPS use
++    // @Description: Controls whether Plane EKF3 uses GPS measurements. Set to 1 for normal ArduPlane GPS behaviour. Set to 0 to prevent EKF3 from reading, aligning to, fusing or reporting raw GPS data, allowing Plane to run from the EKF origin and inertial prediction instead.
++    // @Values: 0:Disabled,1:Enabled
++    // @User: Advanced
++    // @RebootRequired: True
++    AP_GROUPINFO_FRAME("PLN_GPS", 12, NavEKF3, _plane_gps_enable, 1, AP_PARAM_FRAME_PLANE),
++
+     AP_GROUPEND
+ };
+ 
+@@ -754,6 +762,15 @@ NavEKF3::NavEKF3() :
+     AP_Param::setup_object_defaults(this, var_info2);
+ }
+ 
++bool NavEKF3::plane_inertial_nav_enabled(void) const
++{
++#if APM_BUILD_TYPE(APM_BUILD_ArduPlane)
++    return _plane_gps_enable.get() <= 0;
++#else
++    return false;
++#endif
++}
++
+ 
+ // Initialise the filter
+ bool NavEKF3::InitialiseFilter(void)
+@@ -1148,7 +1165,8 @@ bool NavEKF3::healthy(void) const
+ bool NavEKF3::pre_arm_check(bool requires_position, char *failure_msg, uint8_t failure_msg_len) const
+ {
+     // check source configuration
+-    if (!sources.pre_arm_check(requires_position, failure_msg, failure_msg_len)) {
++    const bool check_position_sources = requires_position && !plane_inertial_nav_enabled();
++    if (!sources.pre_arm_check(check_position_sources, failure_msg, failure_msg_len)) {
+         return false;
+     }
+ 
+@@ -1589,6 +1607,10 @@ bool NavEKF3::using_extnav_for_yaw() const
+ // are we using a gps?
+ bool NavEKF3::using_gps(void) const
+ {
++    if (plane_inertial_nav_enabled()) {
++        return false;
++    }
++
+     if (!core) {
+         return false;
+     }
+@@ -1598,6 +1620,10 @@ bool NavEKF3::using_gps(void) const
+ // check if configured to use GPS for horizontal position estimation
+ bool NavEKF3::configuredToUseGPSForPosXY(void) const
+ {
++    if (plane_inertial_nav_enabled()) {
++        return false;
++    }
++
+     // 0 = use 3D velocity, 1 = use 2D velocity, 2 = use no velocity, 3 = do not use GPS
+     if (sources.getPosXYSource(primary) == AP_NavEKF_Source::SourceXY::GPS) {
+         return true;
+@@ -1608,6 +1634,10 @@ bool NavEKF3::configuredToUseGPSForPosXY(void) const
+ // check if configured to use GPS for horizontal position estimation
+ bool NavEKF3::configuredToUseGPSForPos(void) const
+ {
++    if (plane_inertial_nav_enabled()) {
++        return false;
++    }
++
+     if (configuredToUseGPSForPosXY() || sources.getPosZSource(primary) == AP_NavEKF_Source::SourceZ::GPS) {
+         return true;
+     }
+diff --git a/libraries/AP_NavEKF3/AP_NavEKF3.h b/libraries/AP_NavEKF3/AP_NavEKF3.h
+index ddb89547a9..4fdb45f7ee 100644
+--- a/libraries/AP_NavEKF3/AP_NavEKF3.h
++++ b/libraries/AP_NavEKF3/AP_NavEKF3.h
+@@ -405,6 +405,8 @@ private:
+         NONE = 3
+     };
+ 
++    bool plane_inertial_nav_enabled(void) const;
++
+     // EKF Mavlink Tuneable Parameters
+     AP_Int8  _enable;               // zero to disable EKF3
+     AP_Float _gpsHorizVelNoise;     // GPS horizontal velocity measurement noise : m/s
+@@ -473,6 +475,7 @@ private:
+     AP_Enum<LogLevel> _log_level;   // log verbosity level
+     AP_Float _gpsVAccThreshold;     // vertical accuracy threshold to use GPS as an altitude source
+     AP_Int32 _options;              // bit mask of processing options
++    AP_Int8 _plane_gps_enable;      // Plane EKF3 GPS measurement use
+ 
+     // enum for processing options
+     enum class Option {
+diff --git a/libraries/AP_NavEKF3/AP_NavEKF3_Control.cpp b/libraries/AP_NavEKF3/AP_NavEKF3_Control.cpp
+index 6b83d67d74..8da520b0a4 100644
+--- a/libraries/AP_NavEKF3/AP_NavEKF3_Control.cpp
++++ b/libraries/AP_NavEKF3/AP_NavEKF3_Control.cpp
+@@ -287,7 +287,7 @@ void NavEKF3_core::setAidingMode()
+             // and IMU gyro bias estimates have stabilised
+             // If GPS usage has been prohiited then we use flow aiding provided optical flow data is present
+             // GPS aiding is the preferred option unless excluded by the user
+-            if (readyToUseGPS() || readyToUseRangeBeacon() || readyToUseExtNav()) {
++            if (readyToUseGPS() || readyToUsePlaneInertialNav() || readyToUseRangeBeacon() || readyToUseExtNav()) {
+                 PV_AidingMode = AID_ABSOLUTE;
+             } else if (
+ #if EK3_FEATURE_OPTFLOW_FUSION
+@@ -305,7 +305,7 @@ void NavEKF3_core::setAidingMode()
+             bool bodyOdmFusionTimeout = ((imuSampleTime_ms - prevBodyVelFuseTime_ms) > 5000);
+             // Enable switch to absolute position mode if GPS or range beacon data is available
+             // If GPS or range beacons data is not available and flow fusion has timed out, then fall-back to no-aiding
+-            if (readyToUseGPS() || readyToUseRangeBeacon() || readyToUseExtNav()) {
++            if (readyToUseGPS() || readyToUsePlaneInertialNav() || readyToUseRangeBeacon() || readyToUseExtNav()) {
+                 PV_AidingMode = AID_ABSOLUTE;
+             } else if (flowFusionTimeout && bodyOdmFusionTimeout) {
+                 PV_AidingMode = AID_NONE;
+@@ -313,6 +313,13 @@ void NavEKF3_core::setAidingMode()
+             break;
+         }
+         case AID_ABSOLUTE: {
++            if (frontend->plane_inertial_nav_enabled()) {
++                posTimeout = false;
++                velTimeout = false;
++                gpsIsInUse = false;
++                break;
++            }
++
+             // Find the minimum time without data required to trigger any check
+             uint16_t minTestTime_ms = MIN(frontend->tiltDriftTimeMax_ms, MIN(frontend->posRetryTimeNoVel_ms,frontend->posRetryTimeUseVel_ms));
+ 
+@@ -483,6 +490,8 @@ void NavEKF3_core::setAidingMode()
+                     ResetHeight();
+                 }
+ #endif // EK3_FEATURE_EXTERNAL_NAV
++            } else if (readyToUsePlaneInertialNav()) {
++                GCS_SEND_TEXT(MAV_SEVERITY_INFO, "EKF3 IMU%u is using inertial nav",(unsigned)imu_index);
+             }
+ 
+             // clear timeout flags as a precaution to avoid triggering any additional transitions
+@@ -586,6 +595,10 @@ bool NavEKF3_core::readyToUseBodyOdm(void) const
+ // return true if the filter to be ready to use gps
+ bool NavEKF3_core::readyToUseGPS(void) const
+ {
++    if (frontend->plane_inertial_nav_enabled()) {
++        return false;
++    }
++
+     if (frontend->sources.getPosXYSource(core_index) != AP_NavEKF_Source::SourceXY::GPS) {
+         return false;
+     }
+@@ -593,6 +606,16 @@ bool NavEKF3_core::readyToUseGPS(void) const
+     return validOrigin && tiltAlignComplete && yawAlignComplete && (delAngBiasLearned || assume_zero_sideslip()) && gpsGoodToAlign && gpsDataToFuse;
+ }
+ 
++// return true if the filter is ready to run Plane inertial navigation without GPS
++bool NavEKF3_core::readyToUsePlaneInertialNav(void) const
++{
++    return frontend->plane_inertial_nav_enabled() &&
++           validOrigin &&
++           tiltAlignComplete &&
++           yawAlignComplete &&
++           delAngBiasLearned;
++}
++
+ // return true if the filter to be ready to use the beacon range measurements
+ bool NavEKF3_core::readyToUseRangeBeacon(void) const
+ {
+@@ -664,7 +687,7 @@ bool NavEKF3_core::using_extnav_for_yaw() const
+ // are we using a gps
+ bool NavEKF3_core::using_gps() const
+ {
+-    return frontend->sources.usingGPS(core_index);
++    return !frontend->plane_inertial_nav_enabled() && frontend->sources.usingGPS(core_index);
+ }
+ 
+ /*
+@@ -762,6 +785,7 @@ void  NavEKF3_core::updateFilterStatus(void)
+     // init return value
+     nav_filter_status status;
+     status.value = 0;
++    const bool doingPlaneInertialNav = frontend->plane_inertial_nav_enabled() && (PV_AidingMode == AID_ABSOLUTE);
+     bool doingBodyVelNav = (PV_AidingMode != AID_NONE) && (imuSampleTime_ms - prevBodyVelFuseTime_ms < 5000);
+     bool doingFlowNav = (PV_AidingMode != AID_NONE) && flowDataValid;
+     bool doingWindRelNav = (!tasTimeout && assume_zero_sideslip()) || !dragTimeout;
+@@ -794,15 +818,15 @@ void  NavEKF3_core::updateFilterStatus(void)
+     status.flags.takeoff_detected = takeOffDetected; // takeoff for optical flow navigation has been detected
+     status.flags.takeoff = dal.get_takeoff_expected(); // The EKF has been told to expect takeoff is in a ground effect mitigation mode and has started the EKF-GSF yaw estimator
+     status.flags.touchdown = dal.get_touchdown_expected(); // The EKF has been told to detect touchdown and is in a ground effect mitigation mode
+-    status.flags.using_gps = ((imuSampleTime_ms - lastGpsPosPassTime_ms) < 4000) && (PV_AidingMode == AID_ABSOLUTE);
+-    status.flags.gps_glitching = !gpsAccuracyGood && (PV_AidingMode == AID_ABSOLUTE) && (frontend->sources.getPosXYSource(core_index) == AP_NavEKF_Source::SourceXY::GPS); // GPS glitching is affecting navigation accuracy
+-    status.flags.gps_quality_good = gpsGoodToAlign;
++    status.flags.using_gps = !doingPlaneInertialNav && ((imuSampleTime_ms - lastGpsPosPassTime_ms) < 4000) && (PV_AidingMode == AID_ABSOLUTE);
++    status.flags.gps_glitching = !doingPlaneInertialNav && !gpsAccuracyGood && (PV_AidingMode == AID_ABSOLUTE) && (frontend->sources.getPosXYSource(core_index) == AP_NavEKF_Source::SourceXY::GPS); // GPS glitching is affecting navigation accuracy
++    status.flags.gps_quality_good = !doingPlaneInertialNav && gpsGoodToAlign;
+     // for reporting purposes we report rejecting airspeed after 3s of not fusing when we want to fuse the data
+     status.flags.rejecting_airspeed = lastTasFailTime_ms != 0 &&
+                                             (imuSampleTime_ms - lastTasFailTime_ms) < 1000 &&
+                                             (imuSampleTime_ms - lastTasPassTime_ms) > 3000;
+     status.flags.initalized = status.flags.initalized || healthy();
+-    status.flags.dead_reckoning = (PV_AidingMode != AID_NONE) && doingWindRelNav && !((doingFlowNav && gndOffsetValid) || doingNormalGpsNav || doingBodyVelNav);
++    status.flags.dead_reckoning = doingPlaneInertialNav || ((PV_AidingMode != AID_NONE) && doingWindRelNav && !((doingFlowNav && gndOffsetValid) || doingNormalGpsNav || doingBodyVelNav));
+ 
+     filterStatus.value = status.value;
+ }
+diff --git a/libraries/AP_NavEKF3/AP_NavEKF3_Measurements.cpp b/libraries/AP_NavEKF3/AP_NavEKF3_Measurements.cpp
+index 6dfe056290..b06ba0ec4b 100644
+--- a/libraries/AP_NavEKF3/AP_NavEKF3_Measurements.cpp
++++ b/libraries/AP_NavEKF3/AP_NavEKF3_Measurements.cpp
+@@ -559,6 +559,17 @@ bool NavEKF3_core::readDeltaVelocity(uint8_t ins_index, Vector3F &dVel, ftype &d
+ // check for new valid GPS data and update stored measurement if available
+ void NavEKF3_core::readGpsData()
+ {
++    if (frontend->plane_inertial_nav_enabled()) {
++        gpsCheckStatus.bad_fix = false;
++        gpsGoodToAlign = false;
++        gpsAccuracyGood = false;
++        gpsAccuracyGoodForAltitude = false;
++        gpsIsInUse = false;
++        useGpsVertVel = false;
++        waitingForGpsChecks = false;
++        return;
++    }
++
+     // check for new GPS data
+     const auto &gps = dal.gps();
+ 
+@@ -734,6 +745,10 @@ void NavEKF3_core::readGpsData()
+ // check for new valid GPS yaw data
+ void NavEKF3_core::readGpsYawData()
+ {
++    if (frontend->plane_inertial_nav_enabled()) {
++        return;
++    }
++
+     const auto &gps = dal.gps();
+ 
+     // if the GPS has yaw data then fuse it as an Euler yaw angle
+diff --git a/libraries/AP_NavEKF3/AP_NavEKF3_Outputs.cpp b/libraries/AP_NavEKF3/AP_NavEKF3_Outputs.cpp
+index 4ea52ebdba..a5964f4261 100644
+--- a/libraries/AP_NavEKF3/AP_NavEKF3_Outputs.cpp
++++ b/libraries/AP_NavEKF3/AP_NavEKF3_Outputs.cpp
+@@ -387,6 +387,10 @@ bool NavEKF3_core::getLLH(Location &loc) const
+ 
+ bool NavEKF3_core::getGPSLLH(Location &loc) const
+ {
++    if (frontend->plane_inertial_nav_enabled()) {
++        return false;
++    }
++
+     const auto &gps = dal.gps();
+     if ((gps.status(selected_gps) >= AP_GPS_FixType::FIX_3D)) {
+         loc = gps.location(selected_gps);
+diff --git a/libraries/AP_NavEKF3/AP_NavEKF3_core.cpp b/libraries/AP_NavEKF3/AP_NavEKF3_core.cpp
+index f77ea66b27..f455586fbf 100644
+--- a/libraries/AP_NavEKF3/AP_NavEKF3_core.cpp
++++ b/libraries/AP_NavEKF3/AP_NavEKF3_core.cpp
+@@ -483,8 +483,10 @@ bool NavEKF3_core::InitialiseFilterBootstrap(void)
+     // update sensor selection (for affinity)
+     update_sensor_selection();
+ 
++    const bool plane_inertial_nav = frontend->plane_inertial_nav_enabled();
++
+     // If we are a plane and don't have GPS lock then don't initialise
+-    if (assume_zero_sideslip() && dal.gps().status(preferred_gps) < AP_GPS_FixType::FIX_3D) {
++    if (assume_zero_sideslip() && !plane_inertial_nav && dal.gps().status(preferred_gps) < AP_GPS_FixType::FIX_3D) {
+         dal.snprintf(prearm_fail_string,
+                      sizeof(prearm_fail_string),
+                      "EKF3 init failure: No GPS lock");
+@@ -579,6 +581,8 @@ bool NavEKF3_core::InitialiseFilterBootstrap(void)
+     // restore the navigation origin from the public origin if possible:
+     if (public_origin.initialised()) {
+         setOriginLLH(public_origin);
++    } else if (plane_inertial_nav && dal.get_home().initialised()) {
++        setOriginLLH(dal.get_home());
+     }
+ 
+     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "EKF3 IMU%u initialised",(unsigned)imu_index);
+diff --git a/libraries/AP_NavEKF3/AP_NavEKF3_core.h b/libraries/AP_NavEKF3/AP_NavEKF3_core.h
+index c4398b594e..a565262400 100644
+--- a/libraries/AP_NavEKF3/AP_NavEKF3_core.h
++++ b/libraries/AP_NavEKF3/AP_NavEKF3_core.h
+@@ -889,6 +889,9 @@ private:
+     // return true if the vehicle code has requested the filter to be ready for flight
+     bool readyToUseGPS(void) const;
+ 
++    // return true if Plane can run absolute navigation without GPS aiding
++    bool readyToUsePlaneInertialNav(void) const;
++
+     // return true if the filter to be ready to use the beacon range measurements
+     bool readyToUseRangeBeacon(void) const;
+ 
+diff --git a/docs/plane-ekf3-inertial-gps.md b/docs/plane-ekf3-inertial-gps.md
+new file mode 100644
+index 0000000000..bd9985a2c1
+--- /dev/null
++++ b/docs/plane-ekf3-inertial-gps.md
+@@ -0,0 +1,264 @@
++# Plane EKF3 Inertial GPS Patch
++
++Этот патч добавляет в ArduPlane режим, в котором EKF3 не использует GPS-измерения, а Plane продолжает считать положение от EKF origin через инерциальное предсказание.
++
++Режим предназначен для SITL/экспериментов с Plane. Это не полноценная GPS-free навигация с внешним позиционированием: без внешней коррекции инерциальная позиция будет накапливать ошибку.
++
++## Что меняется
++
++Добавлен Plane-only параметр:
++
++| Параметр | Значение |
++| --- | --- |
++| `EK3_PLN_GPS=1` | штатное поведение ArduPlane, EKF3 читает и fuse GPS |
++| `EK3_PLN_GPS=0` | EKF3 не читает GPS, не fuse GPS и не отдает raw GPS fallback |
++
++Параметр объявлен через `AP_GROUPINFO_FRAME(..., AP_PARAM_FRAME_PLANE)`, а runtime-логика дополнительно ограничена сборкой ArduPlane.
++
++## Что делает патч в коде
++
++### `AP_NavEKF3.cpp` / `AP_NavEKF3.h`
++
++Добавлен helper `plane_inertial_nav_enabled()`.
++
++Для ArduPlane он возвращает true, когда:
++
++```text
++EK3_PLN_GPS <= 0
++```
++
++Для остальных vehicle-сборок он всегда возвращает false.
++
++Также frontend-методы `using_gps()`, `configuredToUseGPSForPosXY()` и `configuredToUseGPSForPos()` возвращают false в inertial mode, чтобы внешние слои не считали EKF3 GPS-зависимым.
++
++### `AP_NavEKF3_Measurements.cpp`
++
++В `NavEKF3_core::readGpsData()` добавлен ранний выход.
++
++Когда `EK3_PLN_GPS=0`, EKF3:
++
++- не читает `dal.gps()`;
++- не требует `FIX_3D`;
++- не обновляет GPS accuracy;
++- не выставляет origin из GPS;
++- не пишет `gpsDataNew` в `storedGPS`;
++- не выставляет `gpsIsInUse=true`.
++
++В `readGpsYawData()` также добавлен ранний выход, поэтому GPS yaw не используется.
++
++### `AP_NavEKF3_core.cpp`
++
++В bootstrap убрана обязательная Plane-проверка `No GPS lock`, но только для inertial mode.
++
++Если GPS отключен для EKF3, origin берется из:
++
++1. уже заданного `public_origin`;
++2. иначе из `home`, если он инициализирован.
++
++Без origin EKF3 не сможет вернуть глобальную `Location`, а Plane не сможет нормально выполнять mission.
++
++### `AP_NavEKF3_Control.cpp`
++
++Добавлен путь `readyToUsePlaneInertialNav()`.
++
++EKF3 может перейти в `AID_ABSOLUTE` без GPS, когда готовы:
++
++- origin;
++- tilt alignment;
++- yaw alignment;
++- gyro bias learning.
++
++В этом режиме timeout-логика GPS не переводит фильтр обратно в `AID_NONE`. Статус EKF помечается как `dead_reckoning`, а `using_gps` остается false.
++
++### `AP_NavEKF3_Outputs.cpp`
++
++`getGPSLLH()` возвращает false при `EK3_PLN_GPS=0`.
++
++Это важно: если EKF-позиция временно не готова, ArduPilot больше не использует raw GPS как резервную глобальную позицию.
++
++## Рекомендуемая настройка SITL
++
++Минимально:
++
++```text
++param set AHRS_EKF_TYPE 3
++param set EK3_ENABLE 1
++param set EK3_PLN_GPS 0
++reboot
++```
++
++Чтобы явно убрать GPS из source set 0:
++
++```text
++param set EK3_SRC1_POSXY 0
++param set EK3_SRC1_VELXY 0
++param set EK3_SRC1_VELZ 0
++param set EK3_SRC1_POSZ 1
++param set EK3_SRC1_YAW 1
++reboot
++```
++
++Здесь `0` для `POSXY/VELXY/VELZ` означает `None`, `POSZ=1` означает `Baro`, `YAW=1` означает `Compass`.
++
++## Сборка firmware
++
++Из корня проекта `GpsArduPilot` готовый SITL artifact собирается одной командой:
++
++```bash
++scripts/build-ardupilot-plane-ekf3-inertial-gps.sh
++```
++
++Скрипт применяет patch, запускает `./waf configure --board sitl`, затем `./waf plane`. Сборка идет в директорию `ardupilot/build/<board>`.
++
++Для SITL готовый firmware artifact будет здесь:
++
++```text
++ardupilot/build/sitl/bin/arduplane
++```
++
++Для hardware board итоговые файлы будут здесь:
++
++```text
++ardupilot/build/<board>/bin/arduplane*
++```
++
++Опция `--output-dir` только копирует итоговые файлы в выбранную директорию; основной build output все равно остается внутри `ardupilot/build/<board>`.
++
++SITL artifact нельзя запускать как `arduplane plane`: модель задается флагом. Прямой запуск из корня проекта:
++
++```bash
++ardupilot/build/sitl/bin/arduplane \
++  -w \
++  --model plane \
++  --home 55.7522,37.6156,180,0
++```
++
++Для запуска с MAVProxy и UDP bridge на QGroundControl используй `sim_vehicle.py`, как показано ниже.
++
++Собрать firmware и сразу запустить SITL с MAVProxy:
++
++```bash
++scripts/build-ardupilot-plane-ekf3-inertial-gps.sh --run-sitl
++```
++
++Этот режим после сборки запускает:
++
++```bash
++cd ardupilot
++./Tools/autotest/sim_vehicle.py \
++  -N \
++  -v ArduPlane \
++  -f plane \
++  -w \
++  --custom-location=55.7522,37.6156,180,0
++```
++
++`-N` означает не пересобирать заново внутри `sim_vehicle.py`, а использовать уже собранный `ardupilot/build/sitl/bin/arduplane`.
++
++MAVProxy при таком запуске:
++
++- подключается к firmware через `tcp:127.0.0.1:5760`;
++- открывает output для QGroundControl на UDP `127.0.0.1:14550`;
++- подключает SITL control port `127.0.0.1:5501`.
++
++Если зависимости ArduPilot tooling еще не установлены, можно поставить их из `requirements.txt` перед сборкой:
++
++```bash
++scripts/build-ardupilot-plane-ekf3-inertial-gps.sh --install-python-deps
++```
++
++Для другой board:
++
++```bash
++scripts/build-ardupilot-plane-ekf3-inertial-gps.sh --board CubeOrange
++```
++
++## Запуск SITL
++
++Все команды ниже запускаются из директории `ardupilot`:
++
++```bash
++cd ardupilot
++```
++
++Если ArduPilot tooling пишет `you need to install empy`, `No module named 'pexpect'` или `No such file or directory: 'mavproxy.py'`, установи штатные зависимости ArduPilot для того Python, которым запускаются `waf` и `sim_vehicle.py`.
++
++Официальный macOS-вариант:
++
++```bash
++./Tools/environment_install/install-prereqs-mac.sh -y
++```
++
++Минимально для ошибки из лога:
++
++```bash
++python3 -m pip install empy==3.3.4 pexpect MAVProxy
++python3 -c "import em, pexpect"
++command -v mavproxy.py
++```
++
++Если работаешь не в активном `venv`, можно добавить `--user`. Тогда убедись, что каталог user scripts есть в `PATH`:
++
++```bash
++python3 -m pip install --user empy==3.3.4 pexpect MAVProxy
++export PATH="$(python3 -m site --user-base)/bin:$PATH"
++command -v mavproxy.py
++```
++
++Если `waf` в выводе показывает конкретный интерпретатор, например `/opt/homebrew/opt/python@3.14/bin/python3.14`, используй именно его вместо `python3`. В активном `venv` команда `python3 -m pip install ...` обычно ставит `mavproxy.py` сразу в `venv/bin`.
++
++После этого:
++
++```bash
++./waf configure --board sitl
++./waf plane
++```
++
++```bash
++./Tools/autotest/sim_vehicle.py \
++  -N \
++  -v ArduPlane \
++  -f plane \
++  -w \
++  --custom-location=55.7522,37.6156,180,0
++```
++
++`-N` нужен, если firmware уже собрана через build-скрипт или `./waf plane`. Если хочешь, чтобы `sim_vehicle.py` сам пересобрал firmware перед запуском, убери `-N`.
++
++Прямой запуск уже собранного SITL binary без MAVProxy:
++
++```bash
++./build/sitl/bin/arduplane \
++  -w \
++  --model plane \
++  --home 55.7522,37.6156,180,0
++```
++
++`--custom-location` полезен, потому что задает стартовую home/origin географию для mission.
++
++В многострочной команде после `\` не должно быть пробела.
++
++Патч не добавляет Python-файлы и не требует отдельного окружения проекта.
++
++Если нужен запуск только firmware без MAVProxy, добавь `--no-mavproxy` к `sim_vehicle.py`. В этом режиме автоматического UDP bridge на `127.0.0.1:14550` не будет.
++
++## Что будет видно в QGroundControl
++
++Позиция Plane будет рассчитываться от EKF origin и инерциального состояния. Mission можно строить вокруг стартовой точки, но точность будет деградировать со временем из-за drift.
++
++Патч не обязан менять GPS status panel в QGroundControl. Если SITL GPS продолжает публиковать fix, QGC может его показывать, но EKF3 при `EK3_PLN_GPS=0` эти GPS-измерения не использует.
++
++## Ограничения
++
++- Нужен валидный origin/home.
++- Нужен yaw source, обычно compass.
++- Без GPS/vision/optical-flow/beacon позиция будет уплывать.
++- Режим отключает GPS именно внутри EKF3 Plane path; остальные слои MAVLink/GCS могут продолжать показывать состояние GPS-приемника.
++
++## Проверка
++
++После сборки можно проверить наличие нового параметра:
++
++```bash
++strings build/sitl/bin/arduplane | rg "PLN_GPS"
++```

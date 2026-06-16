@@ -3,10 +3,10 @@ set -euo pipefail
 
 usage() {
     cat <<'USAGE'
-Apply the Plane EKF3 GPS monkeypatch to the local ArduPilot submodule.
+Apply the Plane EKF3 inertial/no-GPS patch to the local ArduPilot submodule.
 
 Usage:
-  scripts/apply-ardupilot-plane-ekf3-gps-monkeypatch.sh [options]
+  scripts/apply-ardupilot-plane-ekf3-inertial-gps.sh [options]
 
 Options:
   --check                 Check whether the patch can be applied or is already applied.
@@ -117,7 +117,7 @@ main() {
 
     root_dir="$(CDPATH= cd -- "$(script_dir)/.." && pwd)"
     ardupilot_dir="$root_dir/ardupilot"
-    patch_file="$root_dir/patches/ardupilot/plane-ekf3-gps-monkeypatch.patch"
+    patch_file="$root_dir/patches/ardupilot/plane-ekf3-inertial-gps.patch"
 
     while [ "$#" -gt 0 ]; do
         case "$1" in
