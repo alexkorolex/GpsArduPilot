@@ -1,112 +1,110 @@
-diff --git a/docs/plane-ekf3-inertial-gps.md b/docs/plane-ekf3-inertial-gps.md
-new file mode 100644
-index 0000000000..69d1e4b80e
---- /dev/null
-+++ b/docs/plane-ekf3-inertial-gps.md
-@@ -0,0 +1,91 @@
-+# ArduPlane SITL no-GPS / NSU ExternalNav
+diff --git a/ArduPlane/ArduPlane.cpp b/ArduPlane/ArduPlane.cpp
+index dd5697330f..8438f8d029 100644
+--- a/ArduPlane/ArduPlane.cpp
++++ b/ArduPlane/ArduPlane.cpp
+@@ -22,6 +22,10 @@
+ 
+ #include "Plane.h"
+ 
++#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
++#include <SITL/SITL.h>
++#endif
 +
-+This package does not add a new EKF parameter and does not modify EKF3 source
-+code. GPS is disabled through existing ArduPilot parameters, and position
-+correction is expected from the ground-control/navigation system through the
-+standard EKF3 ExternalNav source path.
+ #define SCHED_TASK(func, rate_hz, max_time_micros, priority) SCHED_TASK_CLASS(Plane, &plane, func, rate_hz, max_time_micros, priority)
+ #define FAST_TASK(func) FAST_TASK_CLASS(Plane, &plane, func)
+ 
+@@ -351,6 +355,20 @@ void Plane::one_second_loop()
+ 
+     AP::srv().enable_aux_servos();
+ 
++#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
++    // In SITL, --home provides the one-time geographic reference normally
++    // set by GPS or the GCS. It is not used for subsequent position updates.
++    if (!ahrs.home_is_set() && gps.num_sensors() == 0) {
++        const auto *sitl = AP::sitl();
++        if (sitl != nullptr && !sitl->state.home.is_zero()) {
++            if (ahrs.set_home(sitl->state.home)) {
++                next_WP_loc = prev_WP_loc = sitl->state.home;
++                GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "SITL home used for DCM dead-reckoning");
++            }
++        }
++    }
++#endif
 +
-+The old custom EKF switch must not be used.
+     // update notify flags
+     AP_Notify::flags.pre_arm_check = arming.pre_arm_checks(false);
+     AP_Notify::flags.pre_arm_gps_check = true;
+diff --git a/ArduPlane/takeoff.cpp b/ArduPlane/takeoff.cpp
+index 35e71ba433..048054b980 100644
+--- a/ArduPlane/takeoff.cpp
++++ b/ArduPlane/takeoff.cpp
+@@ -1,11 +1,11 @@
+ #include "Plane.h"
+ 
+ /*   Check for automatic takeoff conditions being met using the following sequence:
+- *   1) Check for adequate GPS lock - if not return false
++ *   1) Check for an adequate GPS lock or a valid DCM dead-reckoning position
+  *   2) Check the gravity compensated longitudinal acceleration against the threshold and start the timer if true
+- *   3) Wait until the timer has reached the specified value (increments of 0.1 sec) and then check the GPS speed against the threshold
+- *   4) If the GPS speed is above the threshold and the attitude is within limits then return true and reset the timer
+- *   5) If the GPS speed and attitude within limits has not been achieved after 2.5 seconds, return false and reset the timer
++ *   3) Wait until the timer has reached the specified value (increments of 0.1 sec) and then check the ground speed against the threshold
++ *   4) If the ground speed is above the threshold and the attitude is within limits then return true and reset the timer
++ *   5) If the ground speed and attitude within limits has not been achieved after 2.5 seconds, return false and reset the timer
+  *   6) If the time lapsed since the last timecheck is greater than 0.2 seconds, return false and reset the timer
+  *   NOTE : This function relies on the TECS 50Hz processing for its acceleration measure.
+  */
+@@ -48,11 +48,22 @@ bool Plane::auto_takeoff_check(void)
+        takeoff_state.waiting_for_rudder_neutral = false;
+     }  
+ 
+-    // Check for bad GPS
+-    if (gps.status() < AP_GPS::GPS_OK_FIX_3D) {
+-        // no auto takeoff without GPS lock
++    const bool gps_has_3d_fix = gps.status() >= AP_GPS::GPS_OK_FIX_3D;
++    Location dcm_location;
++    const bool dcm_dead_reckoning_available =
++        gps.num_sensors() == 0 &&
++        ahrs.get_ekf_type() == int8_t(AP_AHRS::EKFType::DCM) &&
++        ahrs.home_is_set() &&
++        ahrs.get_location(dcm_location);
 +
-+## Configuration
-+
-+Use:
-+
-+```text
-+Tools/autotest/default_params/plane-sitl-nsu-no-gps.parm
-+```
-+
-+GPS is disabled:
-+
-+```text
-+GPS1_TYPE      0
-+GPS2_TYPE      0
-+SIM_GPS_DISABLE  1
-+SIM_GPS2_DISABLE 1
-+SIM_GPS_TYPE   0
-+SIM_GPS2_TYPE  0
-+AHRS_GPS_USE   0
-+```
-+
-+`GPS1_TYPE=0` and `GPS2_TYPE=0` disable the ArduPilot GPS drivers.
-+`SIM_GPS_DISABLE=1` and `SIM_GPS2_DISABLE=1` disable the simulated SITL GPS
-+sensors. `SIM_GPS_TYPE=0` and `SIM_GPS2_TYPE=0` leave the simulated GPS type as
-+`None`.
-+
-+EKF3 source set 1 is configured for ExternalNav position, velocity, altitude
-+and vertical velocity. Yaw remains on compass:
-+
-+```text
-+AHRS_EKF_TYPE  3
-+EK3_ENABLE     1
-+EK3_SRC1_POSXY 6
-+EK3_SRC1_VELXY 6
-+EK3_SRC1_POSZ  6
-+EK3_SRC1_VELZ  6
-+EK3_SRC1_YAW   1
-+VISO_TYPE      1
-+```
-+
-+`6` is ExternalNav for the EKF source parameters. `1` is Compass for yaw.
-+`VISO_TYPE=1` enables the MAVLink VisualOdom backend that receives the external
-+navigation data.
-+
-+The defaults file also includes standard Plane SITL RC and accelerometer
-+calibration values. These prevent QGroundControl from requiring manual
-+radio/accelerometer setup after each `-w` run. They do not disable pre-arm
-+checks.
-+
-+## Pre-arm behavior
-+
-+Pre-arm checks are intentionally not bypassed. With this configuration,
-+ArduPlane should not arm for a no-GPS mission unless the ExternalNav data
-+required by the EKF source set is present and healthy.
-+
-+## Height and home
-+
-+Start SITL with an explicit home:
-+
-+```sh
-+./arduplane \
-+  -w \
-+  --defaults plane-sitl-nsu-no-gps.parm \
-+  --model plane \
-+  --home 55.7522,37.6156,180,0
-+```
-+
-+The home altitude initializes the SITL origin. In flight, height correction is
-+expected from ExternalNav through `EK3_SRC1_POSZ=6` and `EK3_SRC1_VELZ=6`.
-+
-+## Logging
-+
-+The same defaults file enables onboard DataFlash logging:
-+
-+```text
-+LOG_BACKEND_TYPE 1
-+LOG_BITMASK      65535
-+LOG_DISARMED     1
-+LOG_REPLAY       1
-+```
-+
-+This records parameters, pre-arm messages, EKF data, barometer, compass and
-+other standard messages without requiring MAVProxy.
++    // DCM dead-reckoning is accepted only when GPS is completely absent.
++    // Normal GPS configurations retain the existing 3D-fix requirement.
++    if (!gps_has_3d_fix && !dcm_dead_reckoning_available) {
+         return false;
+     }
++    const float takeoff_ground_speed = gps_has_3d_fix ?
++        gps.ground_speed() :
++        ahrs.groundspeed();
+ 
+     bool do_takeoff_attitude_check = !(flight_option_enabled(FlightOptions::DISABLE_TOFF_ATTITUDE_CHK));
+ #if HAL_QUADPLANE_ENABLED
+@@ -115,9 +126,9 @@ bool Plane::auto_takeoff_check(void)
+     }
+ 
+     // Check ground speed and time delay
+-    if (((gps.ground_speed() > g.takeoff_throttle_min_speed || is_zero(g.takeoff_throttle_min_speed))) &&
++    if (((takeoff_ground_speed > g.takeoff_throttle_min_speed || is_zero(g.takeoff_throttle_min_speed))) &&
+         ((now - takeoff_state.last_tkoff_arm_time) >= wait_time_ms)) {
+-        gcs().send_text(MAV_SEVERITY_INFO, "Triggered AUTO. GPS speed = %.1f", (double)gps.ground_speed());
++        gcs().send_text(MAV_SEVERITY_INFO, "Triggered AUTO. Ground speed = %.1f", (double)takeoff_ground_speed);
+         takeoff_state.launchTimerStarted = false;
+         takeoff_state.last_tkoff_arm_time = 0;
+         takeoff_state.start_time_ms = now;
 diff --git a/Tools/autotest/default_params/plane-sitl-nsu-no-gps.parm b/Tools/autotest/default_params/plane-sitl-nsu-no-gps.parm
 new file mode 100644
-index 0000000000..3361b826c7
+index 0000000000..d56e500da2
 --- /dev/null
 +++ b/Tools/autotest/default_params/plane-sitl-nsu-no-gps.parm
-@@ -0,0 +1,71 @@
-+# ArduPlane SITL no-GPS configuration for NSU/ExternalNav correction.
-+# GPS is disabled with built-in parameters. EKF3 correction must come from
-+# ExternalNav; pre-arm checks are intentionally left enabled.
+@@ -0,0 +1,77 @@
++# ArduPlane SITL no-GPS/no-ExternalNav configuration.
++# Uses the built-in DCM attitude solution with IMU, compass, barometer and
++# airspeed. Plane dead-reckons from Home for experimental waypoint navigation.
 +
-+AHRS_EKF_TYPE    3
-+EK3_ENABLE       1
++AHRS_EKF_TYPE    0
++EK2_ENABLE       0
++EK3_ENABLE       0
 +
 +GPS1_TYPE        0
 +GPS2_TYPE        0
@@ -116,15 +114,20 @@ index 0000000000..3361b826c7
 +SIM_GPS2_TYPE    0
 +AHRS_GPS_USE     0
 +
-+EK3_SRC1_POSXY   6
-+EK3_SRC1_VELXY   6
-+EK3_SRC1_POSZ    6
-+EK3_SRC1_VELZ    6
-+EK3_SRC1_YAW     1
++# Keep all standard pre-arm checks except GPS and GPS configuration.
++ARMING_CHECK      2093046
 +
-+VISO_TYPE        1
++VISO_TYPE         0
 +
 +ARSPD_USE        1
++
++# AUTO uses the DCM dead-reckoning position for the loaded QGC mission.
++FLTMODE1          10
++FLTMODE2          2
++FLTMODE3          0
++FLTMODE4          6
++FLTMODE5          5
++FLTMODE6          2
 +
 +RC1_MAX          2000
 +RC1_MIN          1000
@@ -172,3 +175,181 @@ index 0000000000..3361b826c7
 +LOG_FILE_BUFSIZE 200
 +LOG_FILE_TIMEOUT 5
 +LOG_REPLAY       1
+diff --git a/docs/plane-ekf3-inertial-gps.md b/docs/plane-ekf3-inertial-gps.md
+new file mode 100644
+index 0000000000..17c8392162
+--- /dev/null
++++ b/docs/plane-ekf3-inertial-gps.md
+@@ -0,0 +1,112 @@
++# ArduPlane experimental no-GPS waypoint navigation
++
++This Plane-only patch allows ArduPlane to execute a QGroundControl waypoint
++mission without GPS, ExternalNav, VisualOdom or MAVLink navigation
++measurements. It does not add firmware parameters.
++
++QGroundControl still uses MAVLink to upload the mission and receive telemetry.
++MAVLink is not used as a position, velocity, altitude or yaw measurement
++source.
++
++## Estimator configuration
++
++Use:
++
++```text
++Tools/autotest/default_params/plane-sitl-nsu-no-gps.parm
++```
++
++The configuration selects the built-in DCM backend:
++
++```text
++AHRS_EKF_TYPE 0
++EK2_ENABLE    0
++EK3_ENABLE    0
++AHRS_GPS_USE  0
++VISO_TYPE     0
++```
++
++GPS drivers and simulated GPS sensors are disabled:
++
++```text
++GPS1_TYPE        0
++GPS2_TYPE        0
++SIM_GPS_DISABLE  1
++SIM_GPS2_DISABLE 1
++SIM_GPS_TYPE     0
++SIM_GPS2_TYPE    0
++```
++
++DCM estimates horizontal motion from airspeed, attitude, compass yaw and wind.
++Barometer data provides the vertical reference used by Plane.
++
++## Initial geographic reference
++
++Latitude and longitude cannot be derived from inertial measurements alone.
++An initial Home is therefore mandatory.
++
++For SITL, pass Home once with `--home`:
++
++```sh
++./arduplane \
++  -w \
++  --defaults plane-sitl-nsu-no-gps.parm \
++  --model plane \
++  --home 55.7522,37.6156,180,0 \
++  --serial0 udpclient:127.0.0.1:14550
++```
++
++The SITL-only Plane code copies that initial reference into AHRS when no GPS
++instance exists. It does not inject subsequent position updates.
++
++On hardware, Home must be set through an existing ArduPilot mechanism before
++arming, for example once from the GCS. The patch does not invent or persist a
++geographic origin.
++
++## AUTO takeoff and waypoint mission
++
++Stock Plane requires a 3D GPS fix in `auto_takeoff_check()`. The patch accepts
++the DCM position only when all of these conditions are true:
++
++- the selected AHRS backend is DCM;
++- ArduPilot has zero GPS instances;
++- Home is set;
++- AHRS currently provides a location.
++
++Normal configurations with a GPS instance retain the original 3D-fix
++requirement. The launch speed check uses the standard DCM ground-speed
++estimate when GPS is absent.
++
++## Safety limitation
++
++This mode is intended for SITL and controlled research only. There is no
++absolute horizontal correction. Compass, airspeed, wind-estimation and IMU
++errors accumulate directly into the reported latitude/longitude, so long
++missions or real flights can diverge substantially from the QGC map.
++
++The parameter file keeps standard arming checks except GPS-related checks. It
++does not disable all pre-arm validation.
++
++## Expected messages and logs
++
++At startup:
++
++```text
++SITL home used for DCM dead-reckoning
++DCM: inertial position from Home
++```
++
++At AUTO launch:
++
++```text
++Triggered AUTO. Ground speed = ...
++```
++
++In QGC or DataFlash logs verify:
++
++- `GPS_RAW_INT.fix_type` remains `0`;
++- satellite count remains `0`;
++- `GLOBAL_POSITION_INT` starts at Home and changes only after arming;
++- `MISSION_CURRENT` advances through the uploaded mission;
++- throttle is released after the AUTO launch check;
++- no `VisOdom not healthy` message is present.
+diff --git a/libraries/AP_AHRS/AP_AHRS_DCM.cpp b/libraries/AP_AHRS/AP_AHRS_DCM.cpp
+index 6a710866ad..789171b63a 100644
+--- a/libraries/AP_AHRS/AP_AHRS_DCM.cpp
++++ b/libraries/AP_AHRS/AP_AHRS_DCM.cpp
+@@ -765,6 +765,25 @@ AP_AHRS_DCM::drift_correction(float deltat)
+         _last_airspeed = MAX(airspeed.x, 0);
+     }
+ 
++#if APM_BUILD_TYPE(APM_BUILD_ArduPlane)
++    // Allow Plane to initialise DCM dead-reckoning from an explicitly set
++    // home when GPS use is disabled. Home defines the initial geographic
++    // reference only; subsequent horizontal motion is estimated from
++    // airspeed, attitude and wind without position measurements.
++    if (!_have_position &&
++        _gps_use == GPSUse::Disable &&
++        AP::ahrs().home_is_set()) {
++        const Location &home = AP::ahrs().get_home();
++        _last_lat = home.lat;
++        _last_lng = home.lng;
++        _last_pos_ms = AP_HAL::millis();
++        _position_offset_north = 0;
++        _position_offset_east = 0;
++        _have_position = true;
++        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "DCM: inertial position from Home");
++    }
++#endif
++
+     if (have_gps()) {
+         // use GPS for positioning with any fix, even a 2D fix
+         _last_lat = _gps.location().lat;
+@@ -778,8 +797,14 @@ AP_AHRS_DCM::drift_correction(float deltat)
+         _have_position = true;
+     } else {
+         // update dead-reckoning position estimate
+-        _position_offset_north += velocity.x * _ra_deltat;
+-        _position_offset_east  += velocity.y * _ra_deltat;
++#if APM_BUILD_TYPE(APM_BUILD_ArduPlane)
++        if (_gps_use != GPSUse::Disable || hal.util->get_soft_armed()) {
++#endif
++            _position_offset_north += velocity.x * _ra_deltat;
++            _position_offset_east  += velocity.y * _ra_deltat;
++#if APM_BUILD_TYPE(APM_BUILD_ArduPlane)
++        }
++#endif
+     }
+ 
+     // see if this is our first time through - in which case we
+@@ -1073,7 +1098,11 @@ bool AP_AHRS_DCM::get_location(Location &loc) const
+     }
+     loc.set_alt_cm(alt_cm, Location::AltFrame::ABSOLUTE);
+     loc.offset(_position_offset_north, _position_offset_east);
+-    if (_have_position) {
++    if (_have_position
++#if APM_BUILD_TYPE(APM_BUILD_ArduPlane)
++        && (_gps_use != GPSUse::Disable || hal.util->get_soft_armed())
++#endif
++        ) {
+         const uint32_t now = AP_HAL::millis();
+         float dt = 0;
+         gps.get_lag(dt);

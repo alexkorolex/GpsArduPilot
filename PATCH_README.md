@@ -1,150 +1,103 @@
-# Как работает текущий no-GPS вариант ArduPlane SITL
+# ArduPlane: waypoint-полёт без GPS и ExternalNav
 
-Этот документ можно отправлять как техническое объяснение заказчику и команде.
-Главная мысль: GPS не отключается новым кодом в EKF. Он отключается штатной
-конфигурацией, а корректировка борта идет от НСУ через штатный ExternalNav.
+Патч предназначен для экспериментальной проверки ArduPlane 4.6.3 в SITL.
+Самолёт принимает waypoint-миссию из QGroundControl и выполняет её без GPS,
+`GPS_INPUT`, ExternalNav и VisualOdom.
 
-## Короткий ответ
+Новых параметров в firmware нет. Используются штатные DCM, airspeed, compass,
+barometer, IMU, Plane navigation и MAVLink mission protocol.
 
-Да, борт должен отбиваться и корректироваться со стороны НСУ.
+## Что означает «без MAVLink»
 
-Если GPS выключен, а НСУ не присылает внешнюю позицию/скорость/высоту, полет
-по координатам невозможен: EKF будет только прогнозировать состояние по IMU,
-компасу, барометру и airspeed, но абсолютная позиция начнет дрейфовать.
+MAVLink не используется как навигационный источник: в AHRS/EKF не поступают
+внешние position/velocity/altitude/yaw measurements.
 
-В текущем варианте НСУ подключается к обычному ArduPilot ExternalNav path.
-Никакого отдельного EKF-переключателя, отдельного MAVLink-скрипта и MAVProxy
-для задачи не требуется.
+Для работы QGC MAVLink всё равно нужен как транспорт:
 
-## Что изменилось относительно старого варианта
+- загрузить waypoint-миссию;
+- переключить режим и выполнить arm;
+- показать телеметрию и расчётную позицию.
 
-Старый вариант добавлял собственный Plane-only EKF-параметр и менял несколько
-участков EKF3. Это убрано.
+## Архитектура
 
-Текущий вариант:
-
-* не добавляет параметры в firmware;
-* не меняет `AP_NavEKF3`;
-* не обходит pre-arm;
-* не выключает GPS из кода;
-* использует только штатные параметры ArduPilot.
-
-Поэтому старый кастомный параметр не должен существовать. Если он где-то
-всплывает, это остаток старого релиза/EEPROM/логов/README, а не текущий
-сценарий.
-
-## Какие источники использует EKF3
-
-Основной файл параметров:
+Параметры выбирают штатный DCM:
 
 ```text
-plane-sitl-nsu-no-gps.parm
+AHRS_EKF_TYPE 0
+EK2_ENABLE    0
+EK3_ENABLE    0
+AHRS_GPS_USE  0
+VISO_TYPE     0
+ARSPD_USE     1
 ```
 
-Ключевой source set:
+GPS полностью отключён:
 
 ```text
-EK3_SRC1_POSXY   6
-EK3_SRC1_VELXY   6
-EK3_SRC1_POSZ    6
-EK3_SRC1_VELZ    6
-EK3_SRC1_YAW     1
-```
-
-Расшифровка:
-
-* `POSXY=6` — горизонтальная позиция от ExternalNav/НСУ.
-* `VELXY=6` — горизонтальная скорость от ExternalNav/НСУ.
-* `POSZ=6` — высота от ExternalNav/НСУ.
-* `VELZ=6` — вертикальная скорость от ExternalNav/НСУ.
-* `YAW=1` — курс от компаса.
-
-Именно так закрываются замечания "высота не обработана" и "компас не
-затронут": высота входит в EKF через ExternalNav source, курс остается на
-штатном compass yaw source.
-
-Чтобы ArduPilot реально принимал эти ExternalNav-измерения по MAVLink,
-включен VisualOdom MAVLink backend:
-
-```text
-VISO_TYPE 1
-```
-
-Без этого параметра `EK3_SRC1_* = 6` уже требует ExternalNav, но входящие
-`ODOMETRY`, `VISION_POSITION_ESTIMATE`, `VISION_SPEED_ESTIMATE` и похожие
-сообщения НСУ будут игнорироваться VisualOdom frontend.
-
-## Как GPS убран
-
-GPS выключается штатно:
-
-```text
-GPS1_TYPE      0
-GPS2_TYPE      0
+GPS1_TYPE        0
+GPS2_TYPE        0
 SIM_GPS_DISABLE  1
 SIM_GPS2_DISABLE 1
-SIM_GPS_TYPE   0
-SIM_GPS2_TYPE  0
-AHRS_GPS_USE   0
+SIM_GPS_TYPE     0
+SIM_GPS2_TYPE    0
 ```
 
-`GPS1_TYPE=0` и `GPS2_TYPE=0` отключают GPS-драйверы в ArduPilot.
-`SIM_GPS_DISABLE=1` и `SIM_GPS2_DISABLE=1` отключают сами GPS-сенсоры в SITL.
-`SIM_GPS_TYPE=0` и `SIM_GPS2_TYPE=0` оставляют тип симулируемого GPS в `None`.
-`AHRS_GPS_USE=0` не дает AHRS использовать GPS как вспомогательный источник.
+Горизонтальное перемещение DCM рассчитывает по штатной оценке скорости:
+airspeed + attitude + compass yaw + wind estimate. Высотный канал Plane
+остаётся на barometer/TECS.
 
-Это штатный путь, без добавления своего параметра.
+Абсолютные широту и долготу получить из инерциальных датчиков невозможно,
+поэтому один раз требуется начальная точка Home. В SITL она берётся из
+`--home`. После старта новые координатные измерения не подмешиваются.
 
-## Pre-arm
+## Изменения кода
 
-Pre-arm не выключается и не обходится.
+### `libraries/AP_AHRS/AP_AHRS_DCM.cpp`
 
-Если source set требует ExternalNav, ArduPilot должен видеть валидные данные
-НСУ до arm. Если данных нет, pre-arm будет падать с сообщениями про source
-check или ExternalNav. Это ожидаемая защита: без НСУ конфигурация без GPS не
-должна уходить в полет.
+Если сборка Plane, `AHRS_GPS_USE=0`, GPS отсутствует и Home уже задан, DCM
+инициализирует dead-reckoning position из Home. Пока борт disarmed, позиция
+заморожена, чтобы QGC не видел дрейф стоящего самолёта.
 
-## Ветер
+Риск: после arm ошибка compass, airspeed и wind estimate интегрируется прямо
+в ошибку координат.
 
-Отдельного "учета ветра" в патче нет, потому что в код EKF не добавляется
-новая модель. Ветер оценивается штатным EKF/Plane стеком по доступным
-измерениям: IMU, airspeed, курс, ExternalNav velocity/position и динамика
-самолета.
+### `ArduPlane/ArduPlane.cpp`
 
-Практически это означает:
+Только в SITL при нулевом числе GPS-инстансов Home из `--home` один раз
+передаётся в AHRS. На hardware этого SITL-пути нет: Home нужно задать штатной
+командой GCS или другим существующим механизмом до arm.
 
-* airspeed должен быть включен и валиден;
-* НСУ должна отдавать достаточно стабильную позицию и скорость;
-* в логе нужно смотреть `XKF*`, airspeed и innovations, а не только факт arm.
+### `ArduPlane/takeoff.cpp`
 
-## Высота и home point
+Штатный Plane запрещает AUTO takeoff без 3D GPS fix. Патч разрешает запуск
+только при одновременно выполненных условиях:
 
-Стартовая точка задается при запуске SITL:
+- выбран `AHRS_EKF_TYPE=0`;
+- зарегистрировано ровно `0` GPS-инстансов;
+- Home задан;
+- DCM выдаёт текущую Location.
 
-```sh
---home 55.7522,37.6156,180,0
-```
+Если GPS-инстанс существует, исходное требование 3D fix сохраняется.
+Launch-speed берётся из штатного `ahrs.groundspeed()`.
 
-Формат:
+## Параметры и pre-arm
+
+Основной файл:
 
 ```text
-широта,долгота,высота_м,курс_градусы
+params/plane-sitl-nsu-no-gps.parm
 ```
 
-Дальше высотная коррекция берется не из GPS, а из НСУ:
+Новые AP_Param не добавлены. `ARMING_CHECK=2093046` сохраняет стандартные
+проверки, кроме GPS и GPS configuration, которые заведомо отсутствуют.
+Остальные проверки датчиков и конфигурации продолжают работать.
 
-```text
-EK3_SRC1_POSZ 6
-EK3_SRC1_VELZ 6
-```
+Параметры `TKOFF_THR_MINACC`, `TKOFF_THR_DELAY` и `TKOFF_THR_MINSPD`
+по-прежнему управляют штатным AUTO launch-check. Для настоящего аппарата их
+нужно настраивать под способ запуска; тестовые значения по умолчанию нельзя
+слепо переносить на hardware.
 
-Если НСУ не присылает корректную высоту, будут проблемы с origin/home/altitude
-и pre-arm или полетная оценка должны это показать. В таком случае надо чинить
-данные НСУ, а не добавлять обходы в EKF.
-
-## Как запускать
-
-Только сам SITL binary:
+## Запуск SITL и QGC
 
 ```sh
 cd release
@@ -160,111 +113,102 @@ cd release
   --serial0 udpclient:127.0.0.1:14550
 ```
 
-QGroundControl подключается напрямую к UDP `127.0.0.1:14550`.
+QGC подключается к UDP `127.0.0.1:14550`. Затем:
 
-MAVProxy не нужен.
+1. Создать миссию, где первый полётный item — `Takeoff`.
+2. Добавить waypoint на разумном расстоянии.
+3. Upload mission.
+4. Переключить Plane в `AUTO`.
+5. Выполнить arm.
 
-## Что должна делать НСУ
+## Ожидаемые сообщения
 
-НСУ должна подавать в ArduPilot ExternalNav-compatible данные: позицию,
-скорость и высоту, согласованные с home/origin. Конкретный транспорт может
-быть тем, который уже используется в проекте, но для EKF это должен быть
-именно штатный ExternalNav input, а не GPS.
-
-Минимальный смысловой набор:
-
-* горизонтальная позиция;
-* горизонтальная скорость;
-* высота;
-* вертикальная скорость;
-* временная согласованность измерений.
-
-Штатные MAVLink входы для этого пути: `ODOMETRY`,
-`VISION_POSITION_ESTIMATE`, `GLOBAL_VISION_POSITION_ESTIMATE`,
-`VICON_POSITION_ESTIMATE`, `ATT_POS_MOCAP`, `VISION_SPEED_ESTIMATE`.
-
-Yaw в текущем файле параметров идет от компаса. Если НСУ должна отдавать yaw,
-тогда `EK3_SRC1_YAW` нужно осознанно менять на `6`, но это отдельное решение.
-
-## QGroundControl setup warning
-
-Если QGC показывает `vehicle requires setup`, это обычно не проблема no-GPS
-части. При запуске с `-w` EEPROM чистый, и QGC видит незаполненные radio/IMU
-калибровки.
-
-В текущий defaults-файл добавлены штатные Plane SITL значения:
-
-* `RC1_*` ... `RC8_*` — виртуальная калибровка RC-каналов;
-* `INS_ACCOFFS_*`, `INS_ACCSCAL_*`, `INS_ACC2OFFS_*`, `INS_ACC2SCAL_*` —
-  виртуальная калибровка двух SITL accelerometer instances;
-* `INS_GYR_CAL=0` — штатное значение из Plane SITL defaults.
-
-Это не отключает pre-arm и не маскирует отсутствие НСУ. Оно только убирает
-требование вручную калибровать виртуальный SITL-самолет в QGC.
-
-## Что смотреть в логе
-
-Логи включены в том же `.parm`:
+До arm:
 
 ```text
-LOG_BACKEND_TYPE 1
-LOG_BITMASK      65535
-LOG_DISARMED     1
-LOG_FILE_DSRMROT 1
-LOG_FILE_BUFSIZE 200
-LOG_FILE_TIMEOUT 5
-LOG_REPLAY       1
+SITL home used for DCM dead-reckoning
+DCM: inertial position from Home
 ```
 
-Файл появляется в `logs/` рабочей директории запуска SITL.
+После arm в AUTO:
 
-Для текстового вывода:
+```text
+Triggered AUTO. Ground speed = ...
+Takeoff complete at ...
+Mission: ... WP
+```
+
+В QGC должно быть:
+
+- GPS fix отсутствует, satellites = 0;
+- карта показывает Home до arm;
+- после arm расчётная позиция движется;
+- `MISSION_CURRENT` переключается по item-ам;
+- нет `PreArm: VisOdom not healthy`.
+
+## Сборка
 
 ```sh
-venv/bin/mavlogdump.py --types PARM,MSG,XKF0,XKF1,XKF2,XKF3,GPS,BARO,MAG logs/00000001.BIN > flight-readable.txt
+scripts/build-ardupilot-plane-ekf3-inertial-gps.sh
 ```
 
-Важно проверить:
+Или напрямую:
 
-* в `PARM` нет старого кастомного EKF-параметра;
-* `GPS1_TYPE/GPS2_TYPE/SIM_GPS_TYPE/SIM_GPS2_TYPE` равны `0`;
-* `SIM_GPS_DISABLE/SIM_GPS2_DISABLE` равны `1`;
-* `EK3_SRC1_*` соответствуют ExternalNav/Compass;
-* pre-arm ругается, если НСУ не подает данные;
-* после подачи НСУ EKF получает ExternalNav innovations и проходит source
-  checks.
+```sh
+cd ardupilot
+./waf configure --board sitl
+./waf plane
+```
 
-## FAQ
+Бинарь:
 
-### Мы вообще борт корректируем в полете?
+```text
+ardupilot/build/sitl/bin/arduplane
+```
 
-Да, но корректировка должна приходить от НСУ как ExternalNav. Сам по себе EKF
-без GPS и без внешних координат не восстановит абсолютную lat/lon.
+## Логи
 
-### Он сам программно корректируется?
+Смотреть `MSG`, `MODE`, `CMD`, `NTUN`, `CTUN`, `BARO`, `MAG`, `ARSP`, `GPS`.
+Ключевые проверки:
 
-EKF корректируется только по тем измерениям, которые реально получает. В этом
-варианте GPS-измерений нет. Поэтому "сам" он может фильтровать IMU, компас,
-airspeed, баро и ExternalNav, но не может заменить НСУ.
+- `GPS` не содержит валидного fix;
+- есть сообщения инициализации DCM от Home;
+- `CTUN.ThO` становится ненулевым после `Triggered AUTO`;
+- mission sequence переходит с Takeoff на WP;
+- координата меняется, но её нельзя считать истинной без внешней коррекции.
 
-### Почему не отключить проверки программно?
+## Проверенный SITL-сценарий
 
-Потому что это убирает защиту. Если НСУ обязательна для полета без GPS,
-pre-arm должен ловить отсутствие НСУ до старта.
+Проверка с Home `55.7522,37.6156,180,0` и миссией
+`Home -> Takeoff 30 m -> waypoint ~111 m north` дала:
 
-### Почему MAVProxy не нужен?
+- arm result: accepted;
+- `Triggered AUTO. Ground speed = 3.5`;
+- throttle: до `100%`;
+- `Takeoff complete at 31.20m`;
+- mission sequence: `1 -> 2`;
+- waypoint достигнут, после чего Plane перешёл в RTL;
+- GPS fix оставался отсутствующим.
 
-Потому что задача проверяет сам SITL и штатную телеметрию. QGC подключается
-напрямую к `arduplane` через UDP или TCP. MAVProxy был только промежуточным
-удобством, сейчас он лишний.
+## Ограничения безопасности
 
-### Что делать, если QGC показывает GPS?
+Это не полноценная inertial navigation system и не production-решение.
+Без GNSS/ExternalNav/оптической коррекции горизонтальная ошибка не ограничена.
+Даже если QGC показывает красивую траекторию, фактическое положение реального
+самолёта может быстро разойтись с картой.
 
-В текущем файле параметров SITL GPS выключен. Если QGC все равно показывает
-старые данные, проверьте, что запуск был с `-w` и именно с
-`plane-sitl-nsu-no-gps.parm`, а не со старым `eeprom.bin`.
+Использовать сначала только в SITL. Перенос на hardware требует отдельного
+анализа Home initialization, airspeed, compass, wind, geofence, RTL,
+failsafe и безопасного launch procedure.
 
-### Можно ли лететь без НСУ?
+## Откат
 
-Для нормальной навигации по координатам — нет. Можно получить только короткий
-инерциальный прогноз с накоплением ошибки, что не закрывает задачу.
+```sh
+scripts/apply-ardupilot-plane-ekf3-inertial-gps.sh --reverse
+```
+
+Либо применить reverse к source-of-truth patch:
+
+```sh
+git -C ardupilot apply --reverse ../patches/ardupilot/plane-ekf3-inertial-gps.patch
+```
