@@ -1,117 +1,95 @@
-## ArduPlane EKF3 Inertial GPS Patch
+## ArduPlane SITL No-GPS / NSU ExternalNav
 
-Этот проект хранит воспроизводимый patch для ArduPilot submodule. Patch добавляет в ArduPlane режим, в котором EKF3 не использует GPS-измерения и продолжает считать положение от EKF origin через инерциальное предсказание.
+Пакет нужен для проверки ArduPlane SITL без GPS. В текущей версии патч не
+добавляет кастомных EKF-параметров и не меняет EKF3-код: режим собирается
+штатными параметрами ArduPilot.
 
-Решение предназначено для SITL-экспериментов и проверки Plane mission flow. Для реальных аппаратов изменение навигационной цепочки требует отдельного ревью.
+Старый кастомный EKF-переключатель больше не используется и не должен
+появляться ни в параметрах, ни в бинаре, ни в документации релиза.
 
 ### Что здесь лежит
 
 * `ardupilot/` — ArduPilot как submodule.
-* `patches/ardupilot/plane-ekf3-inertial-gps.patch` — source of truth для firmware patch.
-* `scripts/apply-ardupilot-plane-ekf3-inertial-gps.sh` — скрипт применения patch к submodule.
-* `scripts/build-ardupilot-plane-ekf3-inertial-gps.sh` — применяет patch и собирает готовый ArduPlane artifact.
-* `requirements.txt` — опциональные Python-зависимости для штатного ArduPilot tooling.
+* `patches/ardupilot/plane-ekf3-inertial-gps.patch` — source of truth для
+  добавляемой документации и SITL defaults.
+* `params/plane-sitl-nsu-no-gps.parm` — один список параметров для запуска
+  SITL без GPS, с EKF3 ExternalNav-коррекцией от НСУ и onboard logs.
+* `scripts/apply-ardupilot-plane-ekf3-inertial-gps.sh` — применяет patch к
+  submodule.
+* `scripts/build-ardupilot-plane-ekf3-inertial-gps.sh` — применяет patch,
+  собирает ArduPlane и при `--run-sitl` запускает сам `arduplane` напрямую.
+* `release/` — готовый бинарь SITL и README для заказчика.
 
-После применения patch внутри submodule появляется подробная документация:
+### Что делает конфигурация
 
-```text
-ardupilot/docs/plane-ekf3-inertial-gps.md
+* Полностью выключает GPS штатными параметрами: `GPS1_TYPE=0`,
+  `GPS2_TYPE=0`, `SIM_GPS_DISABLE=1`, `SIM_GPS2_DISABLE=1`,
+  `SIM_GPS_TYPE=0`, `SIM_GPS2_TYPE=0`, `AHRS_GPS_USE=0`.
+* Включает EKF3: `AHRS_EKF_TYPE=3`, `EK3_ENABLE=1`.
+* Настраивает основной EKF source set на НСУ/ExternalNav:
+  `EK3_SRC1_POSXY=6`, `EK3_SRC1_VELXY=6`, `EK3_SRC1_POSZ=6`,
+  `EK3_SRC1_VELZ=6`.
+* Включает MAVLink backend для внешней одометрии НСУ: `VISO_TYPE=1`.
+* Оставляет курс на компасе: `EK3_SRC1_YAW=1`.
+* Добавляет штатные Plane SITL значения RC и IMU-калибровки, чтобы QGC не
+  требовал ручной radio/accelerometer setup после каждого запуска с `-w`.
+* Не обходит pre-arm проверки. Если НСУ не присылает ExternalNav данные,
+  pre-arm/source checks должны ругаться, и это правильное поведение.
+* Включает onboard DataFlash logs в file backend, чтобы параметры, pre-arm,
+  EKF, BARO, MAG и другие сообщения попали в `.BIN` без MAVProxy.
+
+### Важный ответ по корректировке
+
+Борт должен корректироваться со стороны НСУ. Без GPS и без ExternalNav
+коррекции длительный управляемый полет по координатам невозможен: EKF будет
+только прогнозировать состояние по IMU и быстро накопит ошибку.
+
+В этой конфигурации коррекция идет штатно через EKF3 ExternalNav sources.
+Никакой отдельный MAVLink-скрипт, MAVProxy или программное отключение внутри
+EKF не нужны.
+
+### Быстрый запуск готового release
+
+```sh
+cd release
+chmod +x ./arduplane
+./arduplane \
+  -w \
+  --defaults plane-sitl-nsu-no-gps.parm \
+  --model plane \
+  --speedup 1 \
+  --slave 0 \
+  --sim-address=127.0.0.1 \
+  -I0 \
+  --home 55.7522,37.6156,180,0 \
+  --serial0 udpclient:127.0.0.1:14550
 ```
 
-### Что делает patch
+QGroundControl подключается напрямую к UDP `127.0.0.1:14550`. MAVProxy для
+этой задачи не нужен.
 
-Patch меняет только Plane-ветку поведения:
+Если QGC не слушает UDP, можно убрать `--serial0 ...` и подключиться из QGC
+по TCP к `127.0.0.1:5760`.
 
-* добавляет Plane-only параметр `EK3_PLN_GPS`;
-* при `EK3_PLN_GPS=0` отключает чтение GPS data и GPS yaw внутри EKF3;
-* не пишет GPS measurements в `storedGPS`;
-* не использует raw GPS как fallback для `getLLH()`;
-* разрешает Plane EKF3 bootstrap без GPS lock, если есть валидный home/origin;
-* переводит EKF3 в inertial/dead-reckoning режим без GPS aiding.
-
-### Применение
-
-Собрать готовый SITL artifact одной командой:
+### Сборка
 
 ```sh
 scripts/build-ardupilot-plane-ekf3-inertial-gps.sh
 ```
 
-Скрипт сам применяет patch, запускает `./waf configure --board sitl`, затем `./waf plane`. Сборка идет в директорию `ardupilot/build/<board>`.
-
-Для SITL готовый firmware artifact будет здесь:
+Готовый SITL binary:
 
 ```text
 ardupilot/build/sitl/bin/arduplane
 ```
 
-Для hardware board итоговые файлы будут здесь:
-
-```text
-ardupilot/build/<board>/bin/arduplane*
-```
-
-Опция `--output-dir` только копирует итоговые файлы в выбранную директорию; основной build output все равно остается внутри `ardupilot/build/<board>`.
-
-SITL artifact нельзя запускать как `arduplane plane`: модель задается флагом. Прямой запуск из корня проекта:
-
-```sh
-ardupilot/build/sitl/bin/arduplane \
-  -w \
-  --model plane \
-  --home 55.7522,37.6156,180,0
-```
-
-Для запуска с MAVProxy и UDP bridge на QGroundControl используй `sim_vehicle.py`, как показано ниже.
-
-Собрать firmware и сразу запустить SITL с MAVProxy:
+Собрать и сразу запустить SITL напрямую:
 
 ```sh
 scripts/build-ardupilot-plane-ekf3-inertial-gps.sh --run-sitl
 ```
 
-Этот режим после сборки запускает:
-
-```sh
-cd ardupilot
-./Tools/autotest/sim_vehicle.py \
-  -N \
-  -v ArduPlane \
-  -f plane \
-  -w \
-  --custom-location=55.7522,37.6156,180,0
-```
-
-`-N` означает не пересобирать заново внутри `sim_vehicle.py`, а использовать уже собранный `ardupilot/build/sitl/bin/arduplane`.
-
-MAVProxy при таком запуске:
-
-* подключается к firmware через `tcp:127.0.0.1:5760`;
-* открывает output для QGroundControl на UDP `127.0.0.1:14550`;
-* подключает SITL control port `127.0.0.1:5501`.
-
-Если зависимости ArduPilot tooling еще не установлены, можно использовать добавленный `requirements.txt`:
-
-```sh
-scripts/build-ardupilot-plane-ekf3-inertial-gps.sh --install-python-deps
-```
-
-Для конкретного Python:
-
-```sh
-scripts/build-ardupilot-plane-ekf3-inertial-gps.sh \
-  --install-python-deps \
-  --python /opt/homebrew/opt/python@3.14/bin/python3.14
-```
-
-Скопировать результат в отдельную директорию:
-
-```sh
-scripts/build-ardupilot-plane-ekf3-inertial-gps.sh \
-  --output-dir dist/plane-ekf3-inertial-gps
-```
-
-Собрать под другую board:
+Под другую board:
 
 ```sh
 scripts/build-ardupilot-plane-ekf3-inertial-gps.sh --board CubeOrange
@@ -125,7 +103,7 @@ scripts/build-ardupilot-plane-ekf3-inertial-gps.sh --board CubeOrange
 scripts/apply-ardupilot-plane-ekf3-inertial-gps.sh --check
 ```
 
-Наложить patch на чистый или обновленный `ardupilot` submodule:
+Наложить patch на чистый `ardupilot` submodule:
 
 ```sh
 scripts/apply-ardupilot-plane-ekf3-inertial-gps.sh
@@ -137,144 +115,71 @@ scripts/apply-ardupilot-plane-ekf3-inertial-gps.sh
 scripts/apply-ardupilot-plane-ekf3-inertial-gps.sh --reverse
 ```
 
-Apply-скрипт идемпотентный: если patch уже применен, повторный запуск не меняет файлы.
+### Список параметров
 
-### Ручная сборка ArduPlane SITL
-
-`waf` должен запускаться из директории `ardupilot`, потому что там лежит `wscript`:
-
-```sh
-cd ardupilot
-```
-
-Если ArduPilot tooling пишет `you need to install empy`, `No module named 'pexpect'` или `No such file or directory: 'mavproxy.py'`, установи штатные зависимости ArduPilot для того Python, которым запускаются `waf` и `sim_vehicle.py`.
-
-Официальный macOS-вариант:
-
-```sh
-./Tools/environment_install/install-prereqs-mac.sh -y
-```
-
-Минимально для ошибки из лога:
-
-```sh
-python3 -m pip install empy==3.3.4 pexpect MAVProxy
-python3 -c "import em, pexpect"
-command -v mavproxy.py
-```
-
-Если работаешь не в активном `venv`, можно добавить `--user`. Тогда убедись, что каталог user scripts есть в `PATH`:
-
-```sh
-python3 -m pip install --user empy==3.3.4 pexpect MAVProxy
-export PATH="$(python3 -m site --user-base)/bin:$PATH"
-command -v mavproxy.py
-```
-
-Если `waf` в выводе показывает конкретный интерпретатор, например `/opt/homebrew/opt/python@3.14/bin/python3.14`, используй именно его вместо `python3`. В активном `venv` команда `python3 -m pip install ...` обычно ставит `mavproxy.py` сразу в `venv/bin`.
-
-После этого:
-
-```sh
-./waf configure --board sitl
-./waf plane
-```
-
-Запуск SITL выполняй из той же директории `ardupilot`:
-
-```sh
-./Tools/autotest/sim_vehicle.py \
-  -N \
-  -v ArduPlane \
-  -f plane \
-  -w \
-  --custom-location=55.7522,37.6156,180,0
-```
-
-`-N` нужен, если firmware уже собрана через build-скрипт или `./waf plane`. Если хочешь, чтобы `sim_vehicle.py` сам пересобрал firmware перед запуском, убери `-N`.
-
-Прямой запуск уже собранного SITL binary без MAVProxy:
-
-```sh
-./build/sitl/bin/arduplane \
-  -w \
-  --model plane \
-  --home 55.7522,37.6156,180,0
-```
-
-Если остаешься в корне `GpsArduPilot`, используй путь с префиксом `ardupilot/`:
-
-```sh
-ardupilot/Tools/autotest/sim_vehicle.py \
-  -N \
-  -v ArduPlane \
-  -f plane \
-  -w \
-  --custom-location=55.7522,37.6156,180,0
-```
-
-В многострочной команде после `\` не должно быть пробела.
-
-Сам patch не добавляет Python-файлы и не требует отдельного окружения проекта.
-
-Если нужен запуск только firmware без MAVProxy, добавь `--no-mavproxy` к `sim_vehicle.py`. В этом режиме автоматического UDP bridge на `127.0.0.1:14550` не будет.
-
-QGroundControl подключается к SITL через UDP `127.0.0.1:14550`.
-
-### Минимальная настройка
+Основной файл:
 
 ```text
-param set AHRS_EKF_TYPE 3
-param set EK3_ENABLE 1
-param set EK3_PLN_GPS 0
-reboot
+params/plane-sitl-nsu-no-gps.parm
 ```
 
-Чтобы явно убрать GPS из EKF source set 0:
+Ключевые значения:
 
 ```text
-param set EK3_SRC1_POSXY 0
-param set EK3_SRC1_VELXY 0
-param set EK3_SRC1_VELZ 0
-param set EK3_SRC1_POSZ 1
-param set EK3_SRC1_YAW 1
-reboot
+AHRS_EKF_TYPE    3
+EK3_ENABLE       1
+GPS1_TYPE        0
+GPS2_TYPE        0
+SIM_GPS_DISABLE  1
+SIM_GPS2_DISABLE 1
+SIM_GPS_TYPE     0
+SIM_GPS2_TYPE    0
+AHRS_GPS_USE     0
+EK3_SRC1_POSXY   6
+EK3_SRC1_VELXY   6
+EK3_SRC1_POSZ    6
+EK3_SRC1_VELZ    6
+EK3_SRC1_YAW     1
+VISO_TYPE        1
+ARSPD_USE        1
+RC1_MIN          1000
+RC1_MAX          2000
+RC1_TRIM         1500
+RC3_MIN          1000
+RC3_MAX          2000
+RC3_TRIM         1000
+INS_ACCOFFS_X    0.001
+INS_ACCSCAL_X    1.001
+INS_ACC2OFFS_X   0.001
+INS_ACC2SCAL_X   1.001
+INS_GYR_CAL      0
+LOG_BACKEND_TYPE 1
+LOG_BITMASK      65535
+LOG_DISARMED     1
+LOG_REPLAY       1
 ```
 
-Здесь `POSXY/VELXY/VELZ=0` означает `None`, `POSZ=1` означает `Baro`, `YAW=1` означает `Compass`.
+Значение `6` в `EK3_SRC1_*` — штатный `ExternalNav`. Значение `1` в
+`EK3_SRC1_YAW` — штатный `Compass`.
 
-Вернуть штатное использование GPS в EKF3:
+### Логи
+
+При запуске из `release/` `.BIN` появляется в:
 
 ```text
-param set EK3_PLN_GPS 1
-reboot
+release/logs/
 ```
 
-### Mission в QGroundControl
+Сделать читаемый текст после запуска:
 
-Для первого теста лучше использовать простой маршрут без landing pattern:
-
-```text
-Takeoff 100 m
-Waypoint 1, 300-500 m от старта
-Waypoint 2, 300-500 m от WP1
-RTL
+```sh
+venv/bin/mavlogdump.py --types PARM,MSG,XKF0,XKF1,XKF2,XKF3,GPS,BARO,MAG logs/00000001.BIN > flight-readable.txt
 ```
 
-Plane не может висеть на месте, поэтому слишком близкие точки, `LOITER` или landing sequence могут выглядеть как вращение вокруг точки.
+Для релизного прогона я также сохраняю рядом текстовый лог, если SITL удается
+запустить в текущем окружении.
 
 ### Проверка
 
-Проверить, что параметр попал в собранный `arduplane`:
-
-```sh
-strings ardupilot/build/sitl/bin/arduplane | rg "PLN_GPS"
-```
-
-Быстрая проверка patch-состояния:
-
-```sh
-scripts/apply-ardupilot-plane-ekf3-inertial-gps.sh --check
-```
-
-Полное описание алгоритма, параметров и ограничений находится в `ardupilot/docs/plane-ekf3-inertial-gps.md`.
+Проверьте, что в параметрах и логах нет старого кастомного EKF-переключателя,
+а активные значения совпадают с `plane-sitl-nsu-no-gps.parm`.

@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
     cat <<'USAGE'
-Apply the Plane EKF3 inertial/no-GPS patch and build ArduPlane firmware.
+Apply the Plane SITL no-GPS/ExternalNav patch and build ArduPlane firmware.
 
 Usage:
   scripts/build-ardupilot-plane-ekf3-inertial-gps.sh [options]
@@ -15,12 +15,13 @@ Options:
   --skip-configure           Do not run './waf configure'.
   --clean                    Run './waf clean' before building.
   --install-python-deps      Install Python tooling from requirements.txt first.
-  --python CMD               Python command for --install-python-deps. Default: python3.
+  --python CMD               Python command for dependency install and waf. Default: python3.
   --requirements PATH        Requirements file for --install-python-deps.
-  --run-sitl                 Run SITL with MAVProxy after a successful build.
+  --run-sitl                 Run SITL directly after a successful build.
   --sitl-location LOCATION   SITL home as lat,lng,alt,heading. Default: 55.7522,37.6156,180,0.
-  --no-wipe-eeprom           Do not pass -w to sim_vehicle.py when using --run-sitl.
-  --mavproxy-args ARGS       Extra arguments passed to mavproxy.py through sim_vehicle.py.
+  --sitl-defaults PATH       Defaults file for direct SITL run.
+                             Default: params/plane-sitl-nsu-no-gps.parm.
+  --no-wipe-eeprom           Do not pass -w to arduplane when using --run-sitl.
   --ardupilot-dir PATH       Override the ArduPilot submodule path.
   --patch-file PATH          Override the patch file path.
   -h, --help                 Show this help.
@@ -48,8 +49,9 @@ check_paths() {
     local patch_file="$3"
     local apply_script="$4"
     local requirements_file="$5"
-    local install_python_deps="$6"
-    local skip_patch="$7"
+    local defaults_file="$6"
+    local install_python_deps="$7"
+    local skip_patch="$8"
 
     [ -d "$ardupilot_dir/.git" ] || [ -f "$ardupilot_dir/.git" ] ||
         die "ArduPilot git worktree was not found: $ardupilot_dir"
@@ -67,6 +69,8 @@ check_paths() {
     if [ "$install_python_deps" = "true" ] && [ ! -f "$requirements_file" ]; then
         die "Requirements file was not found: $requirements_file"
     fi
+    [ -f "$defaults_file" ] ||
+        die "SITL defaults file was not found: $defaults_file"
 }
 
 install_python_requirements() {
@@ -90,25 +94,27 @@ apply_inertial_patch() {
 configure_build() {
     local ardupilot_dir="$1"
     local board="$2"
+    local python_cmd="$3"
 
     info "Configuring ArduPlane for board: $board"
     (
         cd "$ardupilot_dir"
-        ./waf configure --board "$board"
+        "$python_cmd" ./waf configure --board "$board"
     )
 }
 
 build_plane() {
     local ardupilot_dir="$1"
     local clean_build="$2"
+    local python_cmd="$3"
 
     info "Building ArduPlane firmware"
     (
         cd "$ardupilot_dir"
         if [ "$clean_build" = "true" ]; then
-            ./waf clean
+            "$python_cmd" ./waf clean
         fi
-        ./waf plane
+        "$python_cmd" ./waf plane
     )
 }
 
@@ -171,37 +177,39 @@ print_sitl_run_hint() {
     fi
 
     info "Run SITL artifact directly with:"
-    printf '  %s/ardupilot/build/sitl/bin/arduplane -w --model plane --home 55.7522,37.6156,180,0\n' "$root_dir"
-    info "Or use sim_vehicle.py when you want MAVProxy/QGroundControl bridge setup."
+    printf '  %s/ardupilot/build/sitl/bin/arduplane -w --defaults %s/params/plane-sitl-nsu-no-gps.parm --model plane --home 55.7522,37.6156,180,0 --serial0 udpclient:127.0.0.1:14550\n' "$root_dir" "$root_dir"
+    info "QGroundControl can connect directly to UDP 127.0.0.1:14550."
 }
 
-run_sitl_with_mavproxy() {
+run_sitl_direct() {
     local ardupilot_dir="$1"
     local sitl_location="$2"
     local wipe_eeprom="$3"
-    local mavproxy_args="$4"
-    local command=(
-        ./Tools/autotest/sim_vehicle.py
-        -N
-        -v ArduPlane
-        -f plane
-        --custom-location "$sitl_location"
-    )
+    local defaults_file="$4"
+    local binary="$ardupilot_dir/build/sitl/bin/arduplane"
+    local command=("$binary")
+
+    [ -x "$binary" ] ||
+        die "SITL binary was not found or is not executable: $binary"
 
     if [ "$wipe_eeprom" = "true" ]; then
         command+=(-w)
     fi
 
-    if [ -n "$mavproxy_args" ]; then
-        command+=(--mavproxy-args "$mavproxy_args")
-    fi
-
-    info "Starting SITL firmware with MAVProxy"
-    info "QGroundControl UDP output: 127.0.0.1:14550"
-    (
-        cd "$ardupilot_dir"
-        "${command[@]}"
+    command+=(
+        --defaults "$defaults_file"
+        --model plane
+        --speedup 1
+        --slave 0
+        --sim-address=127.0.0.1
+        -I0
+        --home "$sitl_location"
+        --serial0 udpclient:127.0.0.1:14550
     )
+
+    info "Starting SITL firmware directly"
+    info "QGroundControl UDP output: 127.0.0.1:14550"
+    "${command[@]}"
 }
 
 main() {
@@ -210,6 +218,7 @@ main() {
     local patch_file
     local apply_script
     local requirements_file
+    local defaults_file
     local board="sitl"
     local output_dir=""
     local skip_patch="false"
@@ -220,13 +229,13 @@ main() {
     local run_sitl="false"
     local sitl_location="55.7522,37.6156,180,0"
     local wipe_eeprom="true"
-    local mavproxy_args=""
 
     root_dir="$(CDPATH= cd -- "$(script_dir)/.." && pwd)"
     ardupilot_dir="$root_dir/ardupilot"
     patch_file="$root_dir/patches/ardupilot/plane-ekf3-inertial-gps.patch"
     apply_script="$root_dir/scripts/apply-ardupilot-plane-ekf3-inertial-gps.sh"
     requirements_file="$root_dir/requirements.txt"
+    defaults_file="$root_dir/params/plane-sitl-nsu-no-gps.parm"
 
     while [ "$#" -gt 0 ]; do
         case "$1" in
@@ -275,14 +284,14 @@ main() {
                 sitl_location="$2"
                 shift 2
                 ;;
+            --sitl-defaults)
+                [ "$#" -ge 2 ] || die "--sitl-defaults requires a path"
+                defaults_file="$2"
+                shift 2
+                ;;
             --no-wipe-eeprom)
                 wipe_eeprom="false"
                 shift
-                ;;
-            --mavproxy-args)
-                [ "$#" -ge 2 ] || die "--mavproxy-args requires a value"
-                mavproxy_args="$2"
-                shift 2
                 ;;
             --ardupilot-dir)
                 [ "$#" -ge 2 ] || die "--ardupilot-dir requires a path"
@@ -308,7 +317,7 @@ main() {
         die "--run-sitl can only be used with --board sitl"
     fi
 
-    check_paths "$root_dir" "$ardupilot_dir" "$patch_file" "$apply_script" "$requirements_file" "$install_python_deps" "$skip_patch"
+    check_paths "$root_dir" "$ardupilot_dir" "$patch_file" "$apply_script" "$requirements_file" "$defaults_file" "$install_python_deps" "$skip_patch"
 
     if [ "$install_python_deps" = "true" ]; then
         install_python_requirements "$python_cmd" "$requirements_file"
@@ -319,10 +328,10 @@ main() {
     fi
 
     if [ "$skip_configure" = "false" ]; then
-        configure_build "$ardupilot_dir" "$board"
+        configure_build "$ardupilot_dir" "$board" "$python_cmd"
     fi
 
-    build_plane "$ardupilot_dir" "$clean_build"
+    build_plane "$ardupilot_dir" "$clean_build" "$python_cmd"
     print_artifacts "$ardupilot_dir" "$board"
     print_sitl_run_hint "$root_dir" "$board"
 
@@ -331,7 +340,7 @@ main() {
     fi
 
     if [ "$run_sitl" = "true" ]; then
-        run_sitl_with_mavproxy "$ardupilot_dir" "$sitl_location" "$wipe_eeprom" "$mavproxy_args"
+        run_sitl_direct "$ardupilot_dir" "$sitl_location" "$wipe_eeprom" "$defaults_file"
     fi
 }
 
