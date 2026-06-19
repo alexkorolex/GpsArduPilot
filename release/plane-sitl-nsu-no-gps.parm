@@ -1,10 +1,11 @@
-# ArduPlane SITL no-GPS/no-ExternalNav configuration.
-# Uses the built-in DCM attitude solution with IMU, compass, barometer and
-# airspeed. Plane dead-reckons from Home for experimental waypoint navigation.
+# ArduPlane SITL EKF3 no-GPS/no-ExternalNav configuration.
+# EKF3 dead-reckons from Home using IMU, compass, barometer, airspeed and
+# the built-in fixed-wing air-data/wind model.
 
-AHRS_EKF_TYPE    0
+AHRS_EKF_TYPE    3
+AHRS_OPTIONS     1
 EK2_ENABLE       0
-EK3_ENABLE       0
+EK3_ENABLE       1
 
 GPS1_TYPE        0
 GPS2_TYPE        0
@@ -19,9 +20,19 @@ ARMING_CHECK      2093046
 
 VISO_TYPE         0
 
+EK3_SRC1_POSXY   0
+EK3_SRC1_VELXY   0
+EK3_SRC1_POSZ    1
+EK3_SRC1_VELZ    0
+EK3_SRC1_YAW     1
+
+COMPASS_ENABLE   1
+COMPASS_USE      1
+
+ARSPD_TYPE       2
 ARSPD_USE        1
 
-# AUTO uses the DCM dead-reckoning position for the loaded QGC mission.
+# AUTO uses the EKF3 dead-reckoning position for the loaded QGC mission.
 FLTMODE1          10
 FLTMODE2          2
 FLTMODE3          0
