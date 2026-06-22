@@ -1,214 +1,187 @@
-# ArduPlane: waypoint-полёт без GPS и ExternalNav
+# ArduPlane: EKF3 AUTO flight without GPS
 
-Патч предназначен для экспериментальной проверки ArduPlane 4.6.3 в SITL.
-Самолёт принимает waypoint-миссию из QGroundControl и выполняет её без GPS,
-`GPS_INPUT`, ExternalNav и VisualOdom.
+## Conclusion
 
-Новых параметров в firmware нет. Используются штатные DCM, airspeed, compass,
-barometer, IMU, Plane navigation и MAVLink mission protocol.
+The patch keeps `AHRS_EKF_TYPE=3` and `EK3_ENABLE=1`. GPS is replaced only as
+the horizontal navigation source; EKF3 remains responsible for the flight
+solution. In SITL, a Plane-only task directly feeds simulator NSU position and
+velocity into EKF3. It does not use VisualOdom or MAVLink navigation messages.
+IMU-only global navigation is not a supported fallback.
 
-## Что означает «без MAVLink»
+ArduPilot's [Non-GPS Navigation](https://ardupilot.org/copter/docs/common-non-gps-navigation-landing-page.html)
+documentation likewise requires an alternative position/velocity source and an
+EKF origin for modes that use global coordinates.
 
-MAVLink не используется как навигационный источник: в AHRS/EKF не поступают
-внешние position/velocity/altitude/yaw measurements.
-
-Для работы QGC MAVLink всё равно нужен как транспорт:
-
-- загрузить waypoint-миссию;
-- переключить режим и выполнить arm;
-- показать телеметрию и расчётную позицию.
-
-## Архитектура
-
-Параметры выбирают штатный DCM:
+## Data flow
 
 ```text
-AHRS_EKF_TYPE 0
-EK2_ENABLE    0
-EK3_ENABLE    0
-AHRS_GPS_USE  0
-VISO_TYPE     0
-ARSPD_USE     1
+SITL NSU position     -> writeExtNavData   -> EK3_SRC1_POSXY=6
+SITL NSU velocity     -> writeExtNavVelData-> EK3_SRC1_VELXY/VELZ=6
+Barometer             -> EK3_SRC1_POSZ=1  -> height
+Compass               -> EK3_SRC1_YAW=1   -> heading
+Airspeed + ground vel -> EKF3 wind states -> wind estimate / TECS inputs
 ```
 
-GPS полностью отключён:
+`VISO_TYPE=0`. The Plane SITL scheduler reads `sitl_fdm` at 50 Hz and calls the
+EKF API directly. `--home` initializes both Origin and Home inside firmware.
+On real hardware this SITL-only feed does not exist; a production NSU still
+requires its own native driver with consistent frames, timing, and covariance.
+
+## Parameters
+
+The source-of-truth defaults are in
+`params/plane-sitl-nsu-no-gps.parm` and
+`ardupilot/Tools/autotest/default_params/plane-sitl-nsu-no-gps.parm`.
 
 ```text
-GPS1_TYPE        0
-GPS2_TYPE        0
-SIM_GPS_DISABLE  1
-SIM_GPS2_DISABLE 1
-SIM_GPS_TYPE     0
-SIM_GPS2_TYPE    0
+AHRS_EKF_TYPE     3
+EK2_ENABLE        0
+EK3_ENABLE        1
+GPS1_TYPE         0
+GPS2_TYPE         0
+SIM_GPS_DISABLE   1
+SIM_GPS2_DISABLE  1
+AHRS_GPS_USE      0
+EK3_SRC1_POSXY    6
+EK3_SRC1_VELXY    6
+EK3_SRC1_POSZ     1
+EK3_SRC1_VELZ     6
+EK3_SRC1_YAW      1
+VISO_TYPE         0
+COMPASS_USE       1
+ARSPD_USE         1
+ARMING_CHECK      1
+RTL_AUTOLAND      3
+INITIAL_MODE      0
+FLTMODE_CH        0
+SIM_TERRAIN       0
+SERVO3_MIN        1000
+SERVO3_TRIM       1000
+SERVO3_MAX        2000
+RC2_REVERSED      1
+RC4_REVERSED      1
+SERVO2_REVERSED   1
+SERVO4_REVERSED   1
 ```
 
-Горизонтальное перемещение DCM рассчитывает по штатной оценке скорости:
-airspeed + attitude + compass yaw + wind estimate. Высотный канал Plane
-остаётся на barometer/TECS.
+## Problems addressed
 
-Абсолютные широту и долготу получить из инерциальных датчиков невозможно,
-поэтому один раз требуется начальная точка Home. В SITL она берётся из
-`--home`. После старта новые координатные измерения не подмешиваются.
+### Wind
 
-## Изменения кода
+The direct NSU feed supplies ground velocity while the airspeed sensor supplies air
+velocity. EKF3 can therefore estimate wind instead of integrating a guessed
+wind into a DCM position. The flight test applies a 4 m/s wind and checks the
+reported speed and direction.
 
-### `libraries/AP_AHRS/AP_AHRS_DCM.cpp`
+### Height
 
-Если сборка Plane, `AHRS_GPS_USE=0`, GPS отсутствует и Home уже задан, DCM
-инициализирует dead-reckoning position из Home. Пока борт disarmed, позиция
-заморожена, чтобы QGC не видел дрейф стоящего самолёта.
+EKF3 uses barometric height (`EK3_SRC1_POSZ=1`) and direct NSU vertical velocity
+(`EK3_SRC1_VELZ=6`). Plane/TECS therefore receives both a referenced height and
+a measured climb rate instead of relying on uncorrected vertical prediction.
 
-Риск: после arm ошибка compass, airspeed и wind estimate интегрируется прямо
-в ошибку координат.
+### Compass
 
-### `ArduPlane/ArduPlane.cpp`
+Yaw explicitly uses the compass (`EK3_SRC1_YAW=1`), and `COMPASS_USE=1` keeps
+its health and earth-field checks active. A magnetic-field warning immediately
+after a simulated ground impact is a valid transient check failure; it clears
+after the aircraft settles and must not be hidden by disabling compass checks.
 
-Только в SITL при нулевом числе GPS-инстансов Home из `--home` один раз
-передаётся в AHRS. На hardware этого SITL-пути нет: Home нужно задать штатной
-командой GCS или другим существующим механизмом до arm.
+### Pre-arm
 
-### `ArduPlane/takeoff.cpp`
+`ARMING_CHECK=1` enables the complete standard check set. The test interrupts
+the direct NSU feed and requires an AHRS pre-arm failure; arming proceeds only
+after the source and EKF solution recover.
 
-Штатный Plane запрещает AUTO takeoff без 3D GPS fix. Патч разрешает запуск
-только при одновременно выполненных условиях:
+### Origin, Home, and altitude
 
-- выбран `AHRS_EKF_TYPE=0`;
-- зарегистрировано ровно `0` GPS-инстансов;
-- Home задан;
-- DCM выдаёт текущую Location.
+Origin defines the geographic reference for local NSU coordinates. Home defines
+relative mission altitude, RTL, and landing behavior. In SITL both are set from
+the `--home LAT,LON,AMSL_ALT,HEADING` argument inside firmware. No MAVLink
+origin/home command is sent.
 
-Если GPS-инстанс существует, исходное требование 3D fix сохраняется.
-Launch-speed берётся из штатного `ahrs.groundspeed()`.
+### QGroundControl landing pattern
 
-## Параметры и pre-arm
+The defaults start in armable MANUAL (`INITIAL_MODE=0`) and disable RC mode
+switch overrides (`FLTMODE_CH=0`). Starting in AUTO before QGC uploads a mission
+would make Plane fall back to RTL, and RTL is intentionally not armable. Wait
+for `Ready To Fly`, upload the complete mission, select AUTO, and then arm.
+`SIM_TERRAIN=0` gives this dedicated test profile a flat runway at Home so the
+simple Plane model does not roll down terrain while QGC is in Plan view. Its
+throttle scale is explicitly `1000/1000/2000`, making disarmed output zero
+instead of the 10% thrust produced by the stock 1100 us trim in this model.
+The upstream `plane-elevrev` RC and servo reversals are included as well; this
+keeps positive AUTO pitch demand physically nose-up.
 
-Основной файл:
+Some QGC releases request Copter/Rover failsafe Facts before filtering the UI
+for a fixed-wing vehicle. The SITL-only Plane parameter block supplies read-only
+`FS_OPTIONS`, `FS_GCS_TIMEOUT`, and `FS_GCS_ENABLE` compatibility Facts. They
+exist only to satisfy QGC and do not replace Plane's real failsafe parameters.
 
-```text
-params/plane-sitl-nsu-no-gps.parm
-```
+QGC adds `DO_LAND_START`, so `RTL_AUTOLAND=0` intentionally fails the Plane
+mission pre-arm check. The packaged default is `3` (`OnlyForGoAround`): AUTO
+can execute the landing sequence and go-around can return to its marker, while
+ordinary RTL behavior is unchanged. Values `1` and `2` deliberately make RTL
+enter the landing sequence.
 
-Новые AP_Param не добавлены. `ARMING_CHECK=2093046` сохраняет стандартные
-проверки, кроме GPS и GPS configuration, которые заведомо отсутствуют.
-Остальные проверки датчиков и конфигурации продолжают работать.
+The touchdown altitude is nominally `0 m` only for a runway at Home elevation
+when mission altitudes are relative. Otherwise use `runway AMSL - Home AMSL`,
+or use absolute AMSL altitudes consistently. Glide distance is
+`height_difference / tan(glide_angle)`; `40 m` at `5 deg` is about `457 m`.
 
-Параметры `TKOFF_THR_MINACC`, `TKOFF_THR_DELAY` и `TKOFF_THR_MINSPD`
-по-прежнему управляют штатным AUTO launch-check. Для настоящего аппарата их
-нужно настраивать под способ запуска; тестовые значения по умолчанию нельзя
-слепо переносить на hardware.
+## Code changes
 
-## Запуск SITL и QGC
+`libraries/AP_NavEKF3/AP_NavEKF3_core.cpp` allows Plane EKF3 bootstrap without
+a 3D GPS fix only when ExternalNav is configured as the horizontal position
+source. The estimator still waits for valid aiding data.
 
-```sh
-cd release
-./arduplane \
-  -w \
-  --defaults plane-sitl-nsu-no-gps.parm \
-  --model plane \
-  --speedup 1 \
-  --slave 0 \
-  --sim-address=127.0.0.1 \
-  -I0 \
-  --home 55.7522,37.6156,180,0 \
-  --serial0 udpclient:127.0.0.1:14550
-```
+`ArduPlane/takeoff.cpp` accepts AUTO launch without GPS only when EKF reports a
+healthy absolute horizontal position and velocity and is not in constant
+position mode. Existing GPS installations retain the original 3D-fix rule.
 
-QGC подключается к UDP `127.0.0.1:14550`. Затем:
+`ArduPlane/sitl_nsu.cpp` is the Plane/SITL-only direct NSU backend. It is not
+compiled into hardware firmware.
 
-1. Создать миссию, где первый полётный item — `Takeoff`.
-2. Добавить waypoint на разумном расстоянии.
-3. Upload mission.
-4. Переключить Plane в `AUTO`.
-5. Выполнить arm.
+`ArduPlane/Parameters.cpp` exposes three SITL-only, read-only compatibility
+Facts required by affected QGC versions. They are not connected to flight
+failsafe decisions.
 
-## Ожидаемые сообщения
+`Tools/autotest/arduplane.py` adds the complete takeoff-flight-land regression
+test and its mission under `ArduPlane_Tests/EKF3ExternalNavNoGPS/`.
 
-До arm:
-
-```text
-SITL home used for DCM dead-reckoning
-DCM: inertial position from Home
-```
-
-После arm в AUTO:
-
-```text
-Triggered AUTO. Ground speed = ...
-Takeoff complete at ...
-Mission: ... WP
-```
-
-В QGC должно быть:
-
-- GPS fix отсутствует, satellites = 0;
-- карта показывает Home до arm;
-- после arm расчётная позиция движется;
-- `MISSION_CURRENT` переключается по item-ам;
-- нет `PreArm: VisOdom not healthy`.
-
-## Сборка
-
-```sh
-scripts/build-ardupilot-plane-ekf3-inertial-gps.sh
-```
-
-Или напрямую:
+## Verification
 
 ```sh
 cd ardupilot
-./waf configure --board sitl
-./waf plane
+../venv/bin/python ./waf plane
+../venv/bin/python Tools/autotest/autotest.py \
+  test.Plane.EKF3ExternalNavNoGPS --speedup=10
 ```
 
-Бинарь:
+The test verifies all of the following in one scenario:
 
-```text
-ardupilot/build/sitl/bin/arduplane
-```
+- EKF3 initializes from the direct NSU feed with both GPS instances disabled;
+- `VISO_TYPE=0` and no `sim:vicon` transport is present;
+- loss of the NSU feed causes a pre-arm failure;
+- SITL waits in armable MANUAL before the mission is loaded;
+- Origin and Home altitude agree;
+- AUTO takeoff succeeds on a healthy EKF3 solution;
+- barometric relative altitude is consistent with Home;
+- `GLOBAL_POSITION_INT.relative_alt` reports the climb to QGC in millimeters;
+- wind is estimated from ExternalNav velocity and airspeed;
+- the aircraft completes the mission, lands, and disarms.
 
-## Логи
+## Risks
 
-Смотреть `MSG`, `MODE`, `CMD`, `NTUN`, `CTUN`, `BARO`, `MAG`, `ARSP`, `GPS`.
-Ключевые проверки:
+This is not an IMU-only navigation mode. NSU loss, timestamp errors,
+frame mismatch, scale error, or drift can move the EKF solution away from the
+real aircraft. Hardware deployment still requires source-loss failsafes,
+compass and airspeed calibration, vibration checks, geofence/RTL review, and
+progressive flight testing after SITL.
 
-- `GPS` не содержит валидного fix;
-- есть сообщения инициализации DCM от Home;
-- `CTUN.ThO` становится ненулевым после `Triggered AUTO`;
-- mission sequence переходит с Takeoff на WP;
-- координата меняется, но её нельзя считать истинной без внешней коррекции.
-
-## Проверенный SITL-сценарий
-
-Проверка с Home `55.7522,37.6156,180,0` и миссией
-`Home -> Takeoff 30 m -> waypoint ~111 m north` дала:
-
-- arm result: accepted;
-- `Triggered AUTO. Ground speed = 3.5`;
-- throttle: до `100%`;
-- `Takeoff complete at 31.20m`;
-- mission sequence: `1 -> 2`;
-- waypoint достигнут, после чего Plane перешёл в RTL;
-- GPS fix оставался отсутствующим.
-
-## Ограничения безопасности
-
-Это не полноценная inertial navigation system и не production-решение.
-Без GNSS/ExternalNav/оптической коррекции горизонтальная ошибка не ограничена.
-Даже если QGC показывает красивую траекторию, фактическое положение реального
-самолёта может быстро разойтись с картой.
-
-Использовать сначала только в SITL. Перенос на hardware требует отдельного
-анализа Home initialization, airspeed, compass, wind, geofence, RTL,
-failsafe и безопасного launch procedure.
-
-## Откат
+## Patch operations
 
 ```sh
+scripts/apply-ardupilot-plane-ekf3-inertial-gps.sh --check
+scripts/apply-ardupilot-plane-ekf3-inertial-gps.sh
 scripts/apply-ardupilot-plane-ekf3-inertial-gps.sh --reverse
-```
-
-Либо применить reverse к source-of-truth patch:
-
-```sh
-git -C ardupilot apply --reverse ../patches/ardupilot/plane-ekf3-inertial-gps.patch
 ```

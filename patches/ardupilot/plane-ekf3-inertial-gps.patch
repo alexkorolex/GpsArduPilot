@@ -1,60 +1,90 @@
 diff --git a/ArduPlane/ArduPlane.cpp b/ArduPlane/ArduPlane.cpp
-index dd5697330f..8438f8d029 100644
+index dd5697330f..be8a38494e 100644
 --- a/ArduPlane/ArduPlane.cpp
 +++ b/ArduPlane/ArduPlane.cpp
-@@ -22,6 +22,10 @@
- 
- #include "Plane.h"
- 
+@@ -64,6 +64,9 @@ const AP_Scheduler::Task Plane::scheduler_tasks[] = {
+     SCHED_TASK(update_speed_height,    50,    200,  12),
+     SCHED_TASK(update_throttle_hover, 100,     90,  24),
+     SCHED_TASK_CLASS(RC_Channels,     (RC_Channels*)&plane.g2.rc_channels, read_mode_switch,           7,    100, 27),
 +#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
-+#include <SITL/SITL.h>
++    SCHED_TASK(update_sitl_nsu,        50,    200,  29),
 +#endif
+     SCHED_TASK(update_GPS_50Hz,        50,    300,  30),
+     SCHED_TASK(update_GPS_10Hz,        10,    400,  33),
+     SCHED_TASK(navigate,               10,    150,  36),
+diff --git a/ArduPlane/Parameters.cpp b/ArduPlane/Parameters.cpp
+index 3dc58e5e3c..e3fc5ee676 100644
+--- a/ArduPlane/Parameters.cpp
++++ b/ArduPlane/Parameters.cpp
+@@ -1302,6 +1302,30 @@ const AP_Param::GroupInfo ParametersG2::var_info[] = {
+     // @Path: systemid.cpp
+     AP_SUBGROUPINFO(systemid, "SID", 38, ParametersG2, AP_SystemID),
+ #endif
 +
- #define SCHED_TASK(func, rate_hz, max_time_micros, priority) SCHED_TASK_CLASS(Plane, &plane, func, rate_hz, max_time_micros, priority)
- #define FAST_TASK(func) FAST_TASK_CLASS(Plane, &plane, func)
- 
-@@ -351,6 +355,20 @@ void Plane::one_second_loop()
- 
-     AP::srv().enable_aux_servos();
- 
 +#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
-+    // In SITL, --home provides the one-time geographic reference normally
-+    // set by GPS or the GCS. It is not used for subsequent position updates.
-+    if (!ahrs.home_is_set() && gps.num_sensors() == 0) {
-+        const auto *sitl = AP::sitl();
-+        if (sitl != nullptr && !sitl->state.home.is_zero()) {
-+            if (ahrs.set_home(sitl->state.home)) {
-+                next_WP_loc = prev_WP_loc = sitl->state.home;
-+                GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "SITL home used for DCM dead-reckoning");
-+            }
-+        }
-+    }
-+#endif
++    // @Param: FS_OPTIONS
++    // @DisplayName: QGC compatibility failsafe options
++    // @Description: Read-only compatibility Fact for QGC. ArduPlane does not use Copter/Rover FS_OPTIONS flight logic.
++    // @ReadOnly: True
++    // @User: Advanced
++    AP_GROUPINFO("FS_OPTIONS", 39, ParametersG2, qgc_fs_options_compat, 0),
 +
-     // update notify flags
-     AP_Notify::flags.pre_arm_check = arming.pre_arm_checks(false);
-     AP_Notify::flags.pre_arm_gps_check = true;
++    // @Param: FS_GCS_TIMEOUT
++    // @DisplayName: QGC compatibility GCS timeout
++    // @Description: Read-only compatibility Fact for QGC. ArduPlane uses FS_LONG_TIMEOUT for its GCS failsafe timeout.
++    // @Units: s
++    // @ReadOnly: True
++    // @User: Advanced
++    AP_GROUPINFO("FS_GCS_TIMEOUT", 40, ParametersG2, qgc_fs_gcs_timeout_compat, 5),
++
++    // @Param: FS_GCS_ENABLE
++    // @DisplayName: QGC compatibility GCS failsafe enable
++    // @Description: Read-only compatibility Fact for QGC. ArduPlane uses FS_GCS_ENABL for its GCS failsafe behavior.
++    // @ReadOnly: True
++    // @User: Advanced
++    AP_GROUPINFO("FS_GCS_ENABLE", 41, ParametersG2, qgc_fs_gcs_enable_compat, 0),
++#endif
+     
+     AP_GROUPEND
+ };
+diff --git a/ArduPlane/Parameters.h b/ArduPlane/Parameters.h
+index 12bdd13fef..bfa240c26e 100644
+--- a/ArduPlane/Parameters.h
++++ b/ArduPlane/Parameters.h
+@@ -591,6 +591,14 @@ public:
+ #if AP_PLANE_SYSTEMID_ENABLED
+     AP_SystemID systemid;
+ #endif
++
++#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
++    // Compatibility Facts requested unconditionally by some QGC versions.
++    // Plane continues to use FS_GCS_ENABL and FS_LONG_TIMEOUT for flight logic.
++    AP_Int32 qgc_fs_options_compat;
++    AP_Float qgc_fs_gcs_timeout_compat;
++    AP_Int8 qgc_fs_gcs_enable_compat;
++#endif
+ };
+ 
+ extern const AP_Param::Info var_info[];
+diff --git a/ArduPlane/Plane.h b/ArduPlane/Plane.h
+index 6837eb6a79..36f08320d6 100644
+--- a/ArduPlane/Plane.h
++++ b/ArduPlane/Plane.h
+@@ -1085,6 +1085,9 @@ private:
+                              uint32_t &log_bit) override;
+     void ahrs_update();
+     void update_speed_height(void);
++#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
++    void update_sitl_nsu(void);
++#endif
+     void update_GPS_50Hz(void);
+     void update_GPS_10Hz(void);
+     void update_compass(void);
 diff --git a/ArduPlane/takeoff.cpp b/ArduPlane/takeoff.cpp
-index 35e71ba433..048054b980 100644
+index 35e71ba433..7816365625 100644
 --- a/ArduPlane/takeoff.cpp
 +++ b/ArduPlane/takeoff.cpp
-@@ -1,11 +1,11 @@
- #include "Plane.h"
- 
- /*   Check for automatic takeoff conditions being met using the following sequence:
-- *   1) Check for adequate GPS lock - if not return false
-+ *   1) Check for an adequate GPS lock or a valid DCM dead-reckoning position
-  *   2) Check the gravity compensated longitudinal acceleration against the threshold and start the timer if true
-- *   3) Wait until the timer has reached the specified value (increments of 0.1 sec) and then check the GPS speed against the threshold
-- *   4) If the GPS speed is above the threshold and the attitude is within limits then return true and reset the timer
-- *   5) If the GPS speed and attitude within limits has not been achieved after 2.5 seconds, return false and reset the timer
-+ *   3) Wait until the timer has reached the specified value (increments of 0.1 sec) and then check the ground speed against the threshold
-+ *   4) If the ground speed is above the threshold and the attitude is within limits then return true and reset the timer
-+ *   5) If the ground speed and attitude within limits has not been achieved after 2.5 seconds, return false and reset the timer
-  *   6) If the time lapsed since the last timecheck is greater than 0.2 seconds, return false and reset the timer
-  *   NOTE : This function relies on the TECS 50Hz processing for its acceleration measure.
-  */
-@@ -48,11 +48,22 @@ bool Plane::auto_takeoff_check(void)
+@@ -48,11 +48,24 @@ bool Plane::auto_takeoff_check(void)
         takeoff_state.waiting_for_rudder_neutral = false;
      }  
  
@@ -62,16 +92,18 @@ index 35e71ba433..048054b980 100644
 -    if (gps.status() < AP_GPS::GPS_OK_FIX_3D) {
 -        // no auto takeoff without GPS lock
 +    const bool gps_has_3d_fix = gps.status() >= AP_GPS::GPS_OK_FIX_3D;
-+    Location dcm_location;
-+    const bool dcm_dead_reckoning_available =
++    nav_filter_status filter_status{};
++    const bool ekf_has_absolute_position =
 +        gps.num_sensors() == 0 &&
-+        ahrs.get_ekf_type() == int8_t(AP_AHRS::EKFType::DCM) &&
-+        ahrs.home_is_set() &&
-+        ahrs.get_location(dcm_location);
++        ahrs.get_ekf_type() != int8_t(AP_AHRS::EKFType::DCM) &&
++        ahrs.get_filter_status(filter_status) &&
++        filter_status.flags.horiz_pos_abs &&
++        filter_status.flags.horiz_vel &&
++        !filter_status.flags.const_pos_mode;
 +
-+    // DCM dead-reckoning is accepted only when GPS is completely absent.
-+    // Normal GPS configurations retain the existing 3D-fix requirement.
-+    if (!gps_has_3d_fix && !dcm_dead_reckoning_available) {
++    // Non-GPS takeoff is allowed only with an absolute position and velocity
++    // solution from an EKF source such as ExternalNav or range beacons.
++    if (!gps_has_3d_fix && !ekf_has_absolute_position) {
          return false;
      }
 +    const float takeoff_ground_speed = gps_has_3d_fix ?
@@ -80,7 +112,7 @@ index 35e71ba433..048054b980 100644
  
      bool do_takeoff_attitude_check = !(flight_option_enabled(FlightOptions::DISABLE_TOFF_ATTITUDE_CHK));
  #if HAL_QUADPLANE_ENABLED
-@@ -115,9 +126,9 @@ bool Plane::auto_takeoff_check(void)
+@@ -115,9 +128,9 @@ bool Plane::auto_takeoff_check(void)
      }
  
      // Check ground speed and time delay
@@ -92,19 +124,296 @@ index 35e71ba433..048054b980 100644
          takeoff_state.launchTimerStarted = false;
          takeoff_state.last_tkoff_arm_time = 0;
          takeoff_state.start_time_ms = now;
+diff --git a/Tools/autotest/arduplane.py b/Tools/autotest/arduplane.py
+index 2fa6fe5077..a626a04c2a 100644
+--- a/Tools/autotest/arduplane.py
++++ b/Tools/autotest/arduplane.py
+@@ -3130,6 +3130,154 @@ class AutoTestPlane(vehicle_test_suite.TestSuite):
+             )
+         self.fly_home_land_and_disarm()
+ 
++    def EKF3ExternalNavNoGPS(self):
++        '''Fly using the direct SITL NSU feed without GPS navigation.'''
++
++        self.set_parameters({
++            "AHRS_EKF_TYPE": 3,
++            "EK2_ENABLE": 0,
++            "EK3_ENABLE": 1,
++            "EK3_SRC1_POSXY": 6,  # ExternalNav
++            "EK3_SRC1_VELXY": 6,  # ExternalNav
++            "EK3_SRC1_POSZ": 1,   # Barometer
++            "EK3_SRC1_VELZ": 6,   # ExternalNav vertical velocity
++            "EK3_SRC1_YAW": 1,    # Compass
++            "GPS1_TYPE": 0,
++            "GPS2_TYPE": 0,
++            "SIM_GPS_DISABLE": 1,
++            "SIM_GPS2_DISABLE": 1,
++            "VISO_TYPE": 0,
++            "COMPASS_USE": 1,
++            "ARSPD_USE": 1,
++            "ARMING_CHECK": 1,
++            "SIM_WIND_SPD": 4,
++            "SIM_WIND_DIR": 45,
++            "TKOFF_THR_MINACC": 0,
++            "TKOFF_THR_MINSPD": 0,
++            "RTL_AUTOLAND": 3,
++            "INITIAL_MODE": 0,  # MANUAL is armable before QGC uploads a mission
++            "FLTMODE_CH": 0,    # do not let simulated RC override QGC modes
++            "SIM_TERRAIN": 0,   # flat runway: no rolling while QGC plans
++            "SERVO3_MIN": 1000,
++            "SERVO3_TRIM": 1000,
++            "SERVO3_MAX": 2000,
++            "RC2_REVERSED": 1,
++            "RC4_REVERSED": 1,
++            "SERVO2_REVERSED": 1,
++            "SERVO4_REVERSED": 1,
++        })
++        self.reboot_sitl()
++
++        # Match the QGC workflow: boot in an armable waiting mode, then upload
++        # the mission and explicitly select AUTO. AUTO at boot has no mission
++        # and Plane falls back to RTL, which is intentionally not armable.
++        self.wait_mode("MANUAL")
++        for name, expected in {
++            "FS_OPTIONS": 0,
++            "FS_GCS_TIMEOUT": 5,
++            "FS_GCS_ENABLE": 0,
++        }.items():
++            value = self.get_parameter(name)
++            if value != expected:
++                raise NotAchievedException(
++                    "%s compatibility value is %s, expected %s" %
++                    (name, value, expected)
++                )
++
++        # Origin and Home must be derived internally from the same --home
++        # reference, without SET_GPS_GLOBAL_ORIGIN or DO_SET_HOME.
++        self.wait_ekf_flags(
++            mavutil.mavlink.ESTIMATOR_POS_HORIZ_ABS,
++            0,
++            timeout=60,
++        )
++        home = self.poll_home_position(timeout=30)
++        expected_home = self.sitl_start_location()
++        if abs(home.latitude * 1.0e-7 - expected_home.lat) > 1.0e-5:
++            raise NotAchievedException("Home latitude does not match SITL origin")
++        if abs(home.longitude * 1.0e-7 - expected_home.lng) > 1.0e-5:
++            raise NotAchievedException("Home longitude does not match SITL origin")
++        if abs(home.altitude * 0.001 - expected_home.alt) > 1:
++            raise NotAchievedException("Home altitude does not match SITL origin")
++
++        # Full pre-arm checks must reject a failed direct NSU feed.
++        self.set_parameter("SIM_VICON_FAIL", 1)
++        self.delay_sim_time(3)
++        self.assert_prearm_failure(
++            "AHRS",
++            timeout=60,
++            other_prearm_failures_fatal=False,
++        )
++        self.set_parameter("SIM_VICON_FAIL", 0)
++        self.reboot_sitl()
++
++        self.wait_mode("MANUAL")
++        home = self.poll_home_position(timeout=30)
++        self.wait_ekf_flags(
++            mavutil.mavlink.ESTIMATOR_POS_HORIZ_ABS,
++            0,
++            timeout=30,
++        )
++        self.wait_sensor_state(
++            mavutil.mavlink.MAV_SYS_STATUS_PREARM_CHECK,
++            present=True,
++            enabled=True,
++            healthy=True,
++            timeout=120,
++        )
++
++        self.load_mission("mission.txt", strict=True)
++        self.set_parameter("RTL_AUTOLAND", 0)
++        self.assert_prearm_failure(
++            "DO_LAND_START set and RTL_AUTOLAND disable",
++            timeout=30,
++            other_prearm_failures_fatal=False,
++        )
++        self.set_parameter("RTL_AUTOLAND", 3)
++        self.wait_sensor_state(
++            mavutil.mavlink.MAV_SYS_STATUS_PREARM_CHECK,
++            present=True,
++            enabled=True,
++            healthy=True,
++            timeout=120,
++        )
++        self.set_current_waypoint(1, check_afterwards=True)
++        self.change_mode('AUTO')
++        self.arm_vehicle()
++
++        # Takeoff, fly the circuit and verify the barometric altitude remains
++        # referenced to the explicitly supplied Home altitude.
++        self.wait_current_waypoint(2, timeout=180)
++        self.wait_altitude(90, 110, relative=True, timeout=120)
++        self.watch_altitude_maintained(
++            altitude_min=85,
++            altitude_max=115,
++            minimum_duration=10,
++            relative=True,
++        )
++        position = self.assert_receive_message('GLOBAL_POSITION_INT')
++        if not 90000 <= position.relative_alt <= 110000:
++            raise NotAchievedException(
++                "QGC relative altitude is not tracking takeoff altitude"
++            )
++        absolute_minus_home = position.alt - home.altitude
++        if abs(absolute_minus_home - position.relative_alt) > 3000:
++            raise NotAchievedException("Absolute and Home-relative altitude diverged")
++
++        # ExternalNav ground velocity plus airspeed makes the EKF wind states
++        # observable. Verify a non-zero estimate before starting the approach.
++        tstart = self.get_sim_time()
++        while True:
++            wind = self.assert_receive_message('WIND')
++            direction_error = abs((wind.direction - 45 + 180) % 360 - 180)
++            if 2.5 <= wind.speed <= 5.5 and direction_error <= 25:
++                break
++            if self.get_sim_time_cached() - tstart > 180:
++                raise AutoTestTimeoutException("EKF3 did not estimate the simulated wind")
++
++        self.wait_current_waypoint(9, timeout=1200)
++        self.wait_disarmed(timeout=240)
++
+     def VectorNavEAHRS(self):
+         '''Test VectorNav EAHRS support'''
+         self.fly_external_AHRS("VectorNav", 1, "ap1.txt")
+@@ -7141,6 +7289,7 @@ class AutoTestPlane(vehicle_test_suite.TestSuite):
+             self.MANUAL_CONTROL,
+             self.RunMissionScript,
+             self.WindEstimates,
++            Test(self.EKF3ExternalNavNoGPS, speedup=10),
+             self.AltResetBadGPS,
+             self.AirspeedCal,
+             self.MissionJumpTags,
+diff --git a/libraries/AP_NavEKF/AP_NavEKF_Source.cpp b/libraries/AP_NavEKF/AP_NavEKF_Source.cpp
+index ececde2d87..e09dd11eba 100644
+--- a/libraries/AP_NavEKF/AP_NavEKF_Source.cpp
++++ b/libraries/AP_NavEKF/AP_NavEKF_Source.cpp
+@@ -18,6 +18,7 @@
+ #include <AP_DAL/AP_DAL.h>
+ #include <AP_Logger/AP_Logger.h>
+ #include <AP_HAL/AP_HAL.h>
++#include <AP_Vehicle/AP_Vehicle_Type.h>
+ 
+ extern const AP_HAL::HAL& hal;
+ 
+@@ -504,6 +505,11 @@ bool AP_NavEKF_Source::pre_arm_check(bool requires_position, char *failure_msg,
+ #if HAL_VISUALODOM_ENABLED
+         auto *vo = AP::dal().visualodom();
+         visualodom_available = vo && vo->enabled();
++#endif
++#if CONFIG_HAL_BOARD == HAL_BOARD_SITL && APM_BUILD_TYPE(APM_BUILD_ArduPlane)
++        // Plane SITL has an in-process NSU feeder and does not require a
++        // VisualOdom/MAVLink backend for ExternalNav measurements.
++        visualodom_available = true;
+ #endif
+         if (!visualodom_available) {
+             hal.util->snprintf(failure_msg, failure_msg_len, ekf_requires_msg, "VisualOdom");
+diff --git a/libraries/AP_NavEKF3/AP_NavEKF3_core.cpp b/libraries/AP_NavEKF3/AP_NavEKF3_core.cpp
+index 2fb368c602..5604bc57f1 100644
+--- a/libraries/AP_NavEKF3/AP_NavEKF3_core.cpp
++++ b/libraries/AP_NavEKF3/AP_NavEKF3_core.cpp
+@@ -472,8 +472,14 @@ bool NavEKF3_core::InitialiseFilterBootstrap(void)
+     // update sensor selection (for affinity)
+     update_sensor_selection();
+ 
+-    // If we are a plane and don't have GPS lock then don't initialise
+-    if (assume_zero_sideslip() && dal.gps().status(preferred_gps) < AP_DAL_GPS::GPS_OK_FIX_3D) {
++    // A fly-forward vehicle normally requires GPS before bootstrap. External
++    // navigation is also an absolute position source, so allow EKF3 to
++    // initialise and wait for that data when it is explicitly configured.
++    const bool using_external_nav =
++        frontend->sources.getPosXYSource() == AP_NavEKF_Source::SourceXY::EXTNAV;
++    if (assume_zero_sideslip() &&
++        !using_external_nav &&
++        dal.gps().status(preferred_gps) < AP_DAL_GPS::GPS_OK_FIX_3D) {
+         dal.snprintf(prearm_fail_string,
+                      sizeof(prearm_fail_string),
+                      "EKF3 init failure: No GPS lock");
+diff --git a/ArduPlane/sitl_nsu.cpp b/ArduPlane/sitl_nsu.cpp
+new file mode 100644
+index 0000000000..9339229391
+--- /dev/null
++++ b/ArduPlane/sitl_nsu.cpp
+@@ -0,0 +1,59 @@
++#include "Plane.h"
++
++#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
++
++#include <SITL/SITL.h>
++
++// Feed the simulated navigation system directly into EKF3. This deliberately
++// bypasses GPS, VisualOdom and every MAVLink navigation-message handler.
++void Plane::update_sitl_nsu()
++{
++    const auto *sitl = AP::sitl();
++    if (sitl == nullptr || sitl->state.home.is_zero()) {
++        return;
++    }
++
++    const Location &origin = sitl->state.home;
++    Location ekf_origin;
++    if (!ahrs.get_origin(ekf_origin)) {
++        IGNORE_RETURN(ahrs.set_origin(origin));
++    }
++    if (!ahrs.home_is_set() && set_home_persistently(origin)) {
++        next_WP_loc = prev_WP_loc = origin;
++    }
++
++    // SIM_VICON_FAIL is reused only as a deterministic NSU failure switch for
++    // the pre-arm regression test. No Vicon transport is instantiated.
++    if (sitl->vicon_fail.get() != 0) {
++        return;
++    }
++
++    const auto &state = sitl->state;
++    if (!isfinite(state.latitude) || !isfinite(state.longitude) ||
++        !isfinite(state.altitude) || !isfinite(state.speedN) ||
++        !isfinite(state.speedE) || !isfinite(state.speedD) ||
++        state.quaternion.is_zero()) {
++        return;
++    }
++
++    const Location location(
++        int32_t(state.latitude * 1.0e7),
++        int32_t(state.longitude * 1.0e7),
++        int32_t(state.altitude * 100.0),
++        Location::AltFrame::ABSOLUTE);
++    const Vector3f position_ned = origin.get_distance_NED(location);
++    const Vector3f velocity_ned(state.speedN, state.speedE, state.speedD);
++    const uint32_t now_ms = AP_HAL::millis();
++
++    ahrs.writeExtNavData(
++        position_ned,
++        state.quaternion,
++        0.1f,
++        radians(5.0f),
++        now_ms,
++        0,
++        0);
++    ahrs.writeExtNavVelData(velocity_ned, 0.1f, now_ms, 0);
++}
++
++#endif  // CONFIG_HAL_BOARD == HAL_BOARD_SITL
 diff --git a/Tools/autotest/default_params/plane-sitl-nsu-no-gps.parm b/Tools/autotest/default_params/plane-sitl-nsu-no-gps.parm
 new file mode 100644
-index 0000000000..d56e500da2
+index 0000000000..d7855408c3
 --- /dev/null
 +++ b/Tools/autotest/default_params/plane-sitl-nsu-no-gps.parm
-@@ -0,0 +1,77 @@
-+# ArduPlane SITL no-GPS/no-ExternalNav configuration.
-+# Uses the built-in DCM attitude solution with IMU, compass, barometer and
-+# airspeed. Plane dead-reckons from Home for experimental waypoint navigation.
+@@ -0,0 +1,110 @@
++# ArduPlane SITL no-GPS configuration with a direct NSU correction.
++# EKF3 fuses direct NSU horizontal data, barometer height, compass yaw
++# and airspeed. Origin and Home must be set to the same geographic reference.
 +
-+AHRS_EKF_TYPE    0
++AHRS_EKF_TYPE    3
 +EK2_ENABLE       0
-+EK3_ENABLE       0
++EK3_ENABLE       1
 +
 +GPS1_TYPE        0
 +GPS2_TYPE        0
@@ -114,14 +423,47 @@ index 0000000000..d56e500da2
 +SIM_GPS2_TYPE    0
 +AHRS_GPS_USE     0
 +
-+# Keep all standard pre-arm checks except GPS and GPS configuration.
-+ARMING_CHECK      2093046
++# Keep every standard pre-arm check enabled. Missing NSU, compass,
++# barometer, airspeed, Origin or Home must prevent arming.
++ARMING_CHECK      1
++
++EK3_SRC1_POSXY    6
++EK3_SRC1_VELXY    6
++EK3_SRC1_POSZ     1
++EK3_SRC1_VELZ     6
++EK3_SRC1_YAW      1
 +
 +VISO_TYPE         0
++COMPASS_USE       1
++ARSPD_USE         1
 +
-+ARSPD_USE        1
++# QGC Fixed Wing Landing Pattern adds DO_LAND_START. Value 3 permits that
++# marker for AUTO/go-around without changing normal RTL behaviour.
++RTL_AUTOLAND      3
 +
-+# AUTO uses the DCM dead-reckoning position for the loaded QGC mission.
++# Start disarmed in an armable mode while QGC has no mission loaded. AUTO
++# cannot be entered without a mission and would fall back to non-armable RTL.
++INITIAL_MODE      0
++FLTMODE_CH        0
++
++# Use a flat SITL runway at Home. The simple Plane model has no parking brake
++# and otherwise rolls down sloped terrain while QGC is planning the mission.
++SIM_TERRAIN       0
++
++# Match the internal Plane model's 1000..2000 throttle scale. The stock
++# 1100 us trim is interpreted by this model as 10% thrust while disarmed.
++SERVO3_MIN        1000
++SERVO3_TRIM       1000
++SERVO3_MAX        2000
++
++# plane-elevrev reverses the simulated elevator and rudder. Match the
++# ArduPlane autotest servo/RC convention so positive pitch demand climbs.
++RC2_REVERSED      1
++RC4_REVERSED      1
++SERVO2_REVERSED   1
++SERVO4_REVERSED   1
++
++# AUTO uses the healthy EKF3 direct NSU solution.
 +FLTMODE1          10
 +FLTMODE2          2
 +FLTMODE3          0
@@ -175,181 +517,106 @@ index 0000000000..d56e500da2
 +LOG_FILE_BUFSIZE 200
 +LOG_FILE_TIMEOUT 5
 +LOG_REPLAY       1
+diff --git a/Tools/autotest/ArduPlane_Tests/EKF3ExternalNavNoGPS/mission.txt b/Tools/autotest/ArduPlane_Tests/EKF3ExternalNavNoGPS/mission.txt
+new file mode 100644
+index 0000000000..6063240d41
+--- /dev/null
++++ b/Tools/autotest/ArduPlane_Tests/EKF3ExternalNavNoGPS/mission.txt
+@@ -0,0 +1,11 @@
++QGC WPL 110
++0	0	0	16	0.000000	0.000000	0.000000	0.000000	-35.363257	149.165237	584.099976	1
++1	0	3	22	15.000000	0.000000	0.000000	0.000000	0.000000	0.000000	80.000000	1
++2	0	3	19	30.000000	0.000000	1.000000	0.000000	-35.356752	149.164022	100.000000	1
++3	0	3	189	0.000000	0.000000	0.000000	0.000000	0.000000	0.000000	100.000000	1
++4	0	3	16	0.000000	0.000000	0.000000	0.000000	-35.360205	149.164455	100.430000	1
++5	0	3	16	0.000000	0.000000	0.000000	0.000000	-35.360629	149.160695	94.470001	1
++6	0	3	16	0.000000	0.000000	0.000000	0.000000	-35.368664	149.161993	83.139999	1
++7	0	3	16	0.000000	0.000000	0.000000	0.000000	-35.368122	149.166056	60.000000	1
++8	0	3	16	0.000000	0.000000	0.000000	0.000000	-35.366814	149.165878	50.000000	1
++9	0	3	21	0.000000	0.000000	0.000000	1.000000	-35.362911	149.165222	0.000000	1
 diff --git a/docs/plane-ekf3-inertial-gps.md b/docs/plane-ekf3-inertial-gps.md
 new file mode 100644
-index 0000000000..17c8392162
+index 0000000000..a9e392b4ac
 --- /dev/null
 +++ b/docs/plane-ekf3-inertial-gps.md
-@@ -0,0 +1,112 @@
-+# ArduPlane experimental no-GPS waypoint navigation
+@@ -0,0 +1,80 @@
++# ArduPlane EKF3 ExternalNav without GPS
 +
-+This Plane-only patch allows ArduPlane to execute a QGroundControl waypoint
-+mission without GPS, ExternalNav, VisualOdom or MAVLink navigation
-+measurements. It does not add firmware parameters.
++This patch keeps Plane on EKF3 while feeding SITL NSU position and velocity
++directly into the EKF API. It does not use GPS, VisualOdom, `sim:vicon`, or
++MAVLink navigation messages, and does not implement IMU-only global navigation.
 +
-+QGroundControl still uses MAVLink to upload the mission and receive telemetry.
-+MAVLink is not used as a position, velocity, altitude or yaw measurement
-+source.
++## Configuration
 +
-+## Estimator configuration
-+
-+Use:
++Use `Tools/autotest/default_params/plane-sitl-nsu-no-gps.parm`:
 +
 +```text
-+Tools/autotest/default_params/plane-sitl-nsu-no-gps.parm
++AHRS_EKF_TYPE   3
++EK2_ENABLE      0
++EK3_ENABLE      1
++EK3_SRC1_POSXY  6
++EK3_SRC1_VELXY  6
++EK3_SRC1_POSZ   1
++EK3_SRC1_VELZ   6
++EK3_SRC1_YAW    1
++VISO_TYPE       0
++COMPASS_USE     1
++ARSPD_USE       1
++ARMING_CHECK    1
++RTL_AUTOLAND    3
 +```
 +
-+The configuration selects the built-in DCM backend:
++Both GPS drivers and both SITL GPS sensors are disabled. The Plane-only SITL
++task provides horizontal position and three-axis velocity directly, the
++barometer provides height, the compass provides yaw, and airspeed plus ground
++velocity makes wind observable.
 +
-+```text
-+AHRS_EKF_TYPE 0
-+EK2_ENABLE    0
-+EK3_ENABLE    0
-+AHRS_GPS_USE  0
-+VISO_TYPE     0
-+```
++Run the SITL aircraft as `--model plane-elevrev`, which is the ArduPlane
++autotest default. The plain `plane` model applies the opposite elevator sign
++for the default servo direction and causes unstable altitude feedback. The
++dedicated defaults use `INITIAL_MODE=0` and `FLTMODE_CH=0`, so Plane waits in
++the armable MANUAL mode before QGC uploads a mission and simulated RC input
++cannot silently replace a QGC-selected mode. Starting in AUTO without a mission
++would fall back to RTL, which Plane intentionally refuses to arm.
++`SIM_TERRAIN=0` keeps the runway flat at Home so the unbraked SITL model remains
++near its launch point while the operator plans the mission. A
++`SERVO3_MIN/TRIM/MAX` range of `1000/1000/2000` maps disarmed output to exactly
++zero thrust in the internal Plane model.
++The `plane-elevrev` profile also requires `RC2_REVERSED=1`, `RC4_REVERSED=1`,
++`SERVO2_REVERSED=1`, and `SERVO4_REVERSED=1`. These match the upstream
++ArduPlane autotest profile; omitting the elevator reversal turns a positive
++takeoff pitch request into a physical nose-down response.
 +
-+GPS drivers and simulated GPS sensors are disabled:
++## Origin and Home
 +
-+```text
-+GPS1_TYPE        0
-+GPS2_TYPE        0
-+SIM_GPS_DISABLE  1
-+SIM_GPS2_DISABLE 1
-+SIM_GPS_TYPE     0
-+SIM_GPS2_TYPE    0
-+```
++Firmware sets EKF Origin and Home to the `--home` latitude, longitude, and AMSL
++altitude. No MAVLink initialization command is required.
 +
-+DCM estimates horizontal motion from airspeed, attitude, compass yaw and wind.
-+Barometer data provides the vertical reference used by Plane.
++## Safety behavior
 +
-+## Initial geographic reference
++All pre-arm checks remain enabled. A failed direct NSU feed must prevent arming.
++AUTO takeoff without GPS is accepted only while EKF reports healthy absolute
++horizontal position and velocity and is not in constant-position mode.
 +
-+Latitude and longitude cannot be derived from inertial measurements alone.
-+An initial Home is therefore mandatory.
++QGC landing patterns contain `DO_LAND_START`. `RTL_AUTOLAND=3` allows this
++marker without changing normal RTL behavior; `RTL_AUTOLAND=0` must fail the
++mission pre-arm check.
 +
-+For SITL, pass Home once with `--home`:
++The QGC sequence is: wait for `Ready To Fly` in MANUAL, upload a mission that
++starts with TAKEOFF and ends with the landing pattern, select AUTO, then arm.
++
++Some QGC versions instantiate Copter/Rover failsafe Facts before applying the
++fixed-wing visibility rules. Plane SITL therefore exposes read-only
++`FS_OPTIONS`, `FS_GCS_TIMEOUT`, and `FS_GCS_ENABLE` compatibility Facts. They do
++not replace Plane's real `FS_GCS_ENABL` and `FS_LONG_TIMEOUT` behavior.
++
++## Test
 +
 +```sh
-+./arduplane \
-+  -w \
-+  --defaults plane-sitl-nsu-no-gps.parm \
-+  --model plane \
-+  --home 55.7522,37.6156,180,0 \
-+  --serial0 udpclient:127.0.0.1:14550
++../venv/bin/python Tools/autotest/autotest.py \
++  test.Plane.EKF3ExternalNavNoGPS --speedup=10
 +```
 +
-+The SITL-only Plane code copies that initial reference into AHRS when no GPS
-+instance exists. It does not inject subsequent position updates.
-+
-+On hardware, Home must be set through an existing ArduPilot mechanism before
-+arming, for example once from the GCS. The patch does not invent or persist a
-+geographic origin.
-+
-+## AUTO takeoff and waypoint mission
-+
-+Stock Plane requires a 3D GPS fix in `auto_takeoff_check()`. The patch accepts
-+the DCM position only when all of these conditions are true:
-+
-+- the selected AHRS backend is DCM;
-+- ArduPilot has zero GPS instances;
-+- Home is set;
-+- AHRS currently provides a location.
-+
-+Normal configurations with a GPS instance retain the original 3D-fix
-+requirement. The launch speed check uses the standard DCM ground-speed
-+estimate when GPS is absent.
-+
-+## Safety limitation
-+
-+This mode is intended for SITL and controlled research only. There is no
-+absolute horizontal correction. Compass, airspeed, wind-estimation and IMU
-+errors accumulate directly into the reported latitude/longitude, so long
-+missions or real flights can diverge substantially from the QGC map.
-+
-+The parameter file keeps standard arming checks except GPS-related checks. It
-+does not disable all pre-arm validation.
-+
-+## Expected messages and logs
-+
-+At startup:
-+
-+```text
-+SITL home used for DCM dead-reckoning
-+DCM: inertial position from Home
-+```
-+
-+At AUTO launch:
-+
-+```text
-+Triggered AUTO. Ground speed = ...
-+```
-+
-+In QGC or DataFlash logs verify:
-+
-+- `GPS_RAW_INT.fix_type` remains `0`;
-+- satellite count remains `0`;
-+- `GLOBAL_POSITION_INT` starts at Home and changes only after arming;
-+- `MISSION_CURRENT` advances through the uploaded mission;
-+- throttle is released after the AUTO launch check;
-+- no `VisOdom not healthy` message is present.
-diff --git a/libraries/AP_AHRS/AP_AHRS_DCM.cpp b/libraries/AP_AHRS/AP_AHRS_DCM.cpp
-index 6a710866ad..789171b63a 100644
---- a/libraries/AP_AHRS/AP_AHRS_DCM.cpp
-+++ b/libraries/AP_AHRS/AP_AHRS_DCM.cpp
-@@ -765,6 +765,25 @@ AP_AHRS_DCM::drift_correction(float deltat)
-         _last_airspeed = MAX(airspeed.x, 0);
-     }
- 
-+#if APM_BUILD_TYPE(APM_BUILD_ArduPlane)
-+    // Allow Plane to initialise DCM dead-reckoning from an explicitly set
-+    // home when GPS use is disabled. Home defines the initial geographic
-+    // reference only; subsequent horizontal motion is estimated from
-+    // airspeed, attitude and wind without position measurements.
-+    if (!_have_position &&
-+        _gps_use == GPSUse::Disable &&
-+        AP::ahrs().home_is_set()) {
-+        const Location &home = AP::ahrs().get_home();
-+        _last_lat = home.lat;
-+        _last_lng = home.lng;
-+        _last_pos_ms = AP_HAL::millis();
-+        _position_offset_north = 0;
-+        _position_offset_east = 0;
-+        _have_position = true;
-+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "DCM: inertial position from Home");
-+    }
-+#endif
-+
-     if (have_gps()) {
-         // use GPS for positioning with any fix, even a 2D fix
-         _last_lat = _gps.location().lat;
-@@ -778,8 +797,14 @@ AP_AHRS_DCM::drift_correction(float deltat)
-         _have_position = true;
-     } else {
-         // update dead-reckoning position estimate
--        _position_offset_north += velocity.x * _ra_deltat;
--        _position_offset_east  += velocity.y * _ra_deltat;
-+#if APM_BUILD_TYPE(APM_BUILD_ArduPlane)
-+        if (_gps_use != GPSUse::Disable || hal.util->get_soft_armed()) {
-+#endif
-+            _position_offset_north += velocity.x * _ra_deltat;
-+            _position_offset_east  += velocity.y * _ra_deltat;
-+#if APM_BUILD_TYPE(APM_BUILD_ArduPlane)
-+        }
-+#endif
-     }
- 
-     // see if this is our first time through - in which case we
-@@ -1073,7 +1098,11 @@ bool AP_AHRS_DCM::get_location(Location &loc) const
-     }
-     loc.set_alt_cm(alt_cm, Location::AltFrame::ABSOLUTE);
-     loc.offset(_position_offset_north, _position_offset_east);
--    if (_have_position) {
-+    if (_have_position
-+#if APM_BUILD_TYPE(APM_BUILD_ArduPlane)
-+        && (_gps_use != GPSUse::Disable || hal.util->get_soft_armed())
-+#endif
-+        ) {
-         const uint32_t now = AP_HAL::millis();
-         float dt = 0;
-         gps.get_lag(dt);
++The test verifies internally initialized Origin/Home, checks direct NSU loss at
++pre-arm, takes off, maintains the commanded height, checks wind, completes an
++AUTO circuit, lands, and disarms.

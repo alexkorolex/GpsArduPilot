@@ -1,85 +1,76 @@
-# ArduPlane 4.6.3: no-GPS waypoint SITL
+# ArduPlane 4.6.3: EKF3 navigation without GPS
 
-Проект содержит экспериментальный Plane-only патч для выполнения
-QGroundControl waypoint-миссии без GPS, ExternalNav и VisualOdom. Новые
-параметры ArduPilot не добавляются.
+This project contains a Plane-only patch and SITL configuration for an AUTO
+mission without GPS. Flight remains on EKF3. In SITL, horizontal position and
+velocity come directly from the simulator's NSU state without MAVLink
+navigation messages. Height comes from the barometer, yaw from the compass,
+and airspeed is used to make the wind states observable.
 
-DCM строит расчётную позицию от начального Home по штатным IMU, compass,
-barometer, airspeed и wind estimate. MAVLink используется только для QGC,
-mission protocol и телеметрии, но не как навигационный measurement input.
+Pure IMU dead reckoning is deliberately not used. Low-cost inertial sensors
+cannot provide a bounded global position without an external correction. This
+matches the ArduPilot [Non-GPS Navigation](https://ardupilot.org/copter/docs/common-non-gps-navigation-landing-page.html)
+guidance.
 
-Важно: без абсолютной коррекции координатная ошибка не ограничена. Это режим
-для SITL и исследований, не безопасная production-навигация.
+## Contents
 
-## Состав
+- `ardupilot/` - ArduPilot Plane 4.6.3 source tree.
+- `patches/ardupilot/plane-ekf3-inertial-gps.patch` - complete unified diff.
+- `params/plane-sitl-nsu-no-gps.parm` - EKF3 no-GPS defaults.
+- `PATCH_README.md` - architecture, setup, risks, and verification.
+- `scripts/apply-ardupilot-plane-ekf3-inertial-gps.sh` - apply/check/reverse.
+- `scripts/build-ardupilot-plane-ekf3-inertial-gps.sh` - SITL build.
 
-- `ardupilot/` — ArduPilot Plane 4.6.3.
-- `patches/ardupilot/plane-ekf3-inertial-gps.patch` — полный unified diff.
-- `params/plane-sitl-nsu-no-gps.parm` — SITL defaults без GPS.
-- `PATCH_README.md` — архитектура, риски и проверка.
-- `scripts/apply-ardupilot-plane-ekf3-inertial-gps.sh` — apply/check/reverse.
-- `scripts/build-ardupilot-plane-ekf3-inertial-gps.sh` — сборка.
-- `release/` — готовый SITL binary и параметры.
-
-Имя patch-файла сохранено для совместимости со скриптами; текущая реализация
-не использует EKF3 и не ожидает НСУ/ExternalNav.
-
-## Быстрый запуск
-
-```sh
-cd release
-chmod +x ./arduplane
-./arduplane \
-  -w \
-  --defaults plane-sitl-nsu-no-gps.parm \
-  --model plane \
-  --speedup 1 \
-  --slave 0 \
-  --sim-address=127.0.0.1 \
-  -I0 \
-  --home 55.7522,37.6156,180,0 \
-  --serial0 udpclient:127.0.0.1:14550
-```
-
-QGC подключается к UDP `127.0.0.1:14550`. Загрузите миссию с `Takeoff`,
-переведите Plane в `AUTO` и выполните arm.
-
-## Ключевые штатные параметры
+## EKF configuration
 
 ```text
-AHRS_EKF_TYPE    0
+AHRS_EKF_TYPE    3
 EK2_ENABLE       0
-EK3_ENABLE       0
-GPS1_TYPE        0
-GPS2_TYPE        0
-SIM_GPS_DISABLE  1
-SIM_GPS2_DISABLE 1
-SIM_GPS_TYPE     0
-SIM_GPS2_TYPE    0
-AHRS_GPS_USE     0
+EK3_ENABLE       1
+EK3_SRC1_POSXY   6  # ExternalNav
+EK3_SRC1_VELXY   6  # ExternalNav
+EK3_SRC1_POSZ    1  # Barometer
+EK3_SRC1_VELZ    6  # ExternalNav vertical velocity
+EK3_SRC1_YAW     1  # Compass
 VISO_TYPE        0
+COMPASS_USE      1
 ARSPD_USE        1
-ARMING_CHECK     2093046
+ARMING_CHECK     1
 ```
 
-## Patch
+GPS drivers and SITL GPS sensors are disabled. `ARMING_CHECK=1` retains all
+standard pre-arm checks; an unhealthy direct NSU solution must block arming.
+
+## Required setup
+
+For SITL, `--home` is the single geographic reference. Firmware sets EKF Origin
+and Home from it internally, then feeds simulator position and velocity directly
+to EKF3. No `SET_GPS_GLOBAL_ORIGIN`, `DO_SET_HOME`, VisualOdom or `sim:vicon`
+transport is used.
+
+QGroundControl still requires MAVLink for mission upload, arm/mode commands and
+telemetry. That control channel is not a navigation measurement source.
+
+## Patch and build
 
 ```sh
 scripts/apply-ardupilot-plane-ekf3-inertial-gps.sh --check
 scripts/apply-ardupilot-plane-ekf3-inertial-gps.sh
-scripts/apply-ardupilot-plane-ekf3-inertial-gps.sh --reverse
-```
-
-## Сборка
-
-```sh
 scripts/build-ardupilot-plane-ekf3-inertial-gps.sh
 ```
 
-Готовый binary:
+The built SITL binary is `ardupilot/build/sitl/bin/arduplane`.
 
-```text
-ardupilot/build/sitl/bin/arduplane
+## Automated flight test
+
+```sh
+cd ardupilot
+../venv/bin/python Tools/autotest/autotest.py \
+  test.Plane.EKF3ExternalNavNoGPS --speedup=10
 ```
 
-Подробности и проверенный mission-сценарий: `PATCH_README.md`.
+The test disables GPS, injects SITL ExternalNav, verifies the pre-arm failure
+when that source is lost, verifies the QGC-like armable MANUAL startup, sets
+matching Origin/Home, uploads the mission, takes off in AUTO, checks height and
+wind estimation, verifies QGC's `GLOBAL_POSITION_INT.relative_alt`, flies the
+circuit, lands, and disarms. The packaged `plane-elevrev` profile includes the
+matching elevator/rudder reversals and QGC failsafe-Fact compatibility fields.

@@ -177,7 +177,7 @@ print_sitl_run_hint() {
     fi
 
     info "Run SITL artifact directly with:"
-    printf '  %s/ardupilot/build/sitl/bin/arduplane -w --defaults %s/params/plane-sitl-nsu-no-gps.parm --model plane --home 55.7522,37.6156,180,0 --serial0 udpclient:127.0.0.1:14550\n' "$root_dir" "$root_dir"
+    printf '  %s/ardupilot/build/sitl/bin/arduplane -w --defaults %s/params/plane-sitl-nsu-no-gps.parm --model plane-elevrev --home 55.7522,37.6156,180,0 --serial0 udpclient:127.0.0.1:14550\n' "$root_dir" "$root_dir"
     info "QGroundControl can connect directly to UDP 127.0.0.1:14550."
 }
 
@@ -198,7 +198,7 @@ run_sitl_direct() {
 
     command+=(
         --defaults "$defaults_file"
-        --model plane
+        --model plane-elevrev
         --speedup 1
         --slave 0
         --sim-address=127.0.0.1
